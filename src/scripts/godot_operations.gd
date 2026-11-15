@@ -67,6 +67,8 @@ func _init():
             export_mesh_library(params)
         "save_scene":
             save_scene(params)
+        "set_node_property":
+            set_node_property(params)
         "get_uid":
             get_uid(params)
         "resave_resources":
@@ -1090,6 +1092,82 @@ func resave_resources(params):
     print("Resave operation complete")
 
 # Save changes to a scene file
+# Set one property on a node of an existing scene. The value is a Godot literal,
+# such as 42, true, "text", or Vector2(1, 2), parsed with str_to_var().
+# node_path is written like "root/Player"; its first segment is the scene root.
+func set_node_property(params):
+    print("Setting property on scene: " + params.scene_path)
+
+    var full_scene_path = params.scene_path
+    if not full_scene_path.begins_with("res://"):
+        full_scene_path = "res://" + full_scene_path
+
+    if not FileAccess.file_exists(full_scene_path):
+        printerr("Failed to set property: scene file does not exist at " + full_scene_path)
+        quit(1)
+        return
+
+    var scene = load(full_scene_path)
+    if not scene:
+        printerr("Failed to set property: could not load scene " + full_scene_path)
+        quit(1)
+        return
+
+    var scene_root = scene.instantiate()
+    var node_path: String = params.node_path
+    var root_name = str(scene_root.name)
+    var relative_path = node_path
+    if node_path == root_name:
+        relative_path = "."
+    elif node_path.begins_with(root_name + "/"):
+        relative_path = node_path.substr(root_name.length() + 1)
+
+    var node = scene_root if relative_path == "." else scene_root.get_node_or_null(relative_path)
+    if node == null:
+        printerr("Failed to set property: node not found: " + node_path)
+        scene_root.free()
+        quit(1)
+        return
+
+    var property_name: String = params.property
+    var has_property := false
+    for info in node.get_property_list():
+        if str(info.name) == property_name:
+            has_property = true
+            break
+    if not has_property:
+        printerr("Failed to set property: node " + node_path + " has no property " + property_name)
+        scene_root.free()
+        quit(1)
+        return
+
+    var value_text: String = params.value
+    var value = str_to_var(value_text)
+    if value == null and value_text.strip_edges() != "null":
+        printerr("Failed to set property: value is not a valid Godot literal: " + value_text)
+        scene_root.free()
+        quit(1)
+        return
+
+    node.set(property_name, value)
+
+    var packed_scene = PackedScene.new()
+    var pack_result = packed_scene.pack(scene_root)
+    if pack_result != OK:
+        printerr("Failed to set property: could not pack scene, error " + str(pack_result))
+        scene_root.free()
+        quit(1)
+        return
+
+    var save_error = ResourceSaver.save(packed_scene, full_scene_path)
+    scene_root.free()
+    if save_error != OK:
+        printerr("Failed to set property: could not save scene, error " + str(save_error))
+        quit(1)
+        return
+
+    print("Property " + property_name + " set on " + node_path + " in " + full_scene_path)
+
 func save_scene(params):
     print("Saving scene: " + params.scene_path)
     

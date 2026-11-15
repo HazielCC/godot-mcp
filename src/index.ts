@@ -9,7 +9,7 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize, resolve as resolvePath, relative, isAbsolute } from 'path';
-import { existsSync, readdirSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
@@ -36,11 +36,44 @@ const __dirname = dirname(__filename);
 /**
  * Interface representing a running Godot process
  */
+/** A node read from a .tscn file (see read_scene). */
+interface SceneNodeInfo {
+  name: string;
+  type: string | null;
+  parent: string | null;
+  instance: string | null;
+  // Path such as "root/Player", starting with the root name.
+  path: string;
+  properties: Record<string, string>;
+  children: SceneNodeInfo[];
+}
+
 /** Maximum lines kept per output stream (stdout and stderr) of a running Godot process. */
 const MAX_BUFFERED_LINES = 2000;
 
 /** Maximum script errors archived from lines that were already dropped from the buffers. */
 const MAX_ARCHIVED_SCRIPT_ERRORS = 500;
+
+/**
+ * Parameters of each tool that are file paths inside the project. Every one of them is
+ * checked before the tool runs, so no tool can read or write outside the project folder.
+ */
+const PROJECT_PATH_PARAMS: Record<string, string[]> = {
+  create_scene: ['scenePath'],
+  add_node: ['scenePath'],
+  load_sprite: ['scenePath', 'texturePath'],
+  save_scene: ['scenePath', 'newPath'],
+  export_mesh_library: ['scenePath', 'outputPath'],
+  get_uid: ['filePath'],
+  read_scene: ['scenePath'],
+  set_node_property: ['scenePath'],
+};
+
+/** Extensions Godot imports into a .import file and a cached resource (see diagnose_project). */
+const IMPORTABLE_EXTENSIONS = [
+  'png', 'jpg', 'jpeg', 'webp', 'svg', 'bmp', 'tga', 'exr', 'hdr', 'dds',
+  'wav', 'ogg', 'mp3', 'glb', 'gltf', 'fbx', 'ttf', 'otf', 'obj',
+];
 
 interface GodotProcess {
   process: any;
@@ -1010,12 +1043,83 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'diagnose_project',
+          description: 'Diagnose a Godot project: the Godot executable and version, whether the project is imported, importable assets that have no .import file (which makes load_sprite and other tools fail), and .import files whose outputs are missing. Read-only unless runImport is true.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              runImport: {
+                type: 'boolean',
+                description: 'Import the project first (godot --headless --import). This writes .import files and the import cache. Default false.',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'read_scene',
+          description: 'Read an existing .tscn scene as a tree of nodes, with each node\'s type, path (for example "root/Player") and properties, plus its external and sub-resources. Read-only; does not need Godot.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the .tscn file, relative to the project (e.g., "scenes/main.tscn")',
+              },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'set_node_property',
+          description: 'Set one property on a node of an existing scene and save the scene. The value is a Godot literal, such as 42, true, "text", or Vector2(1, 2). The node is named by its path, such as "root/Player". Requires Godot.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the .tscn file, relative to the project',
+              },
+              nodePath: {
+                type: 'string',
+                description: 'Path of the node inside the scene, starting with the root name (e.g., "root/Player")',
+              },
+              property: {
+                type: 'string',
+                description: 'Property name, such as position or texture',
+              },
+              value: {
+                type: 'string',
+                description: 'Godot literal for the new value, such as 42, true, "text", or Vector2(1, 2)',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'nodePath', 'property', 'value'],
+          },
+        },
       ],
     }));
 
     // Handle tool calls
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       this.logDebug(`Handling tool request: ${request.params.name}`);
+      const scoped = this.scopeProjectPaths(request.params.name, request.params.arguments);
+      if ('error' in scoped) {
+        return scoped.error;
+      }
+      request.params.arguments = scoped.args;
       switch (request.params.name) {
         case 'launch_editor':
           return await this.handleLaunchEditor(request.params.arguments);
@@ -1051,6 +1155,12 @@ class GodotServer {
           return await this.handleCheckProjectScripts(request.params.arguments);
         case 'run_tests':
           return await this.handleRunTests(request.params.arguments);
+        case 'diagnose_project':
+          return await this.handleDiagnoseProject(request.params.arguments);
+        case 'read_scene':
+          return await this.handleReadScene(request.params.arguments);
+        case 'set_node_property':
+          return await this.handleSetNodeProperty(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -2033,6 +2143,501 @@ class GodotServer {
     } catch (error: any) {
       return this.createErrorResponse(
         `Failed to run tests: ${error?.message || 'Unknown error'}`,
+        ['Ensure Godot is installed and GODOT_PATH is set correctly']
+      );
+    }
+  }
+
+  /**
+   * Check that a path used for reading or writing stays inside the project folder.
+   * Accepts a project-relative path, optionally prefixed with res://. Rejects absolute
+   * paths, drive letters, paths that climb out with "..", and links inside the project
+   * that lead outside it. Returns the normalized path relative to the project.
+   */
+  private resolveInsideProject(projectPath: string, value: unknown): { relPath: string } | { error: string } {
+    if (typeof value !== 'string' || value.trim() === '') {
+      return { error: 'A path relative to the project is required' };
+    }
+
+    const projectRoot = resolvePath(projectPath);
+    if (!existsSync(projectRoot)) {
+      return { error: `Project directory does not exist: ${projectPath}` };
+    }
+
+    const cleaned = value.replace(/\\/g, '/').replace(/^res:\/\//, '');
+    if (cleaned.startsWith('/') || /^[A-Za-z]:/.test(cleaned) || isAbsolute(cleaned)) {
+      return { error: `Path must be relative to the project, not absolute: ${value}` };
+    }
+
+    const target = resolvePath(projectRoot, cleaned);
+    const rel = relative(projectRoot, target).replace(/\\/g, '/');
+    if (rel === '' || rel === '..' || rel.startsWith('../')) {
+      return { error: `Path is outside the project: ${value}` };
+    }
+
+    // A link inside the project must not lead outside it either. Check the nearest
+    // existing ancestor, because the target itself may not exist yet.
+    let existing = target;
+    while (!existsSync(existing) && dirname(existing) !== existing) {
+      existing = dirname(existing);
+    }
+    const realRel = relative(realpathSync(projectRoot), realpathSync(existing)).replace(/\\/g, '/');
+    if (realRel === '..' || realRel.startsWith('../') || isAbsolute(realRel)) {
+      return { error: `Path leads outside the project through a link: ${value}` };
+    }
+
+    return { relPath: rel };
+  }
+
+  /**
+   * Apply resolveInsideProject to every path parameter of a tool (see PROJECT_PATH_PARAMS).
+   * Tools without path parameters, and invalid projectPath values, pass through unchanged so
+   * the handler reports its own error.
+   */
+  private scopeProjectPaths(toolName: string, rawArgs: any): { args: any } | { error: any } {
+    const pathParams = PROJECT_PATH_PARAMS[toolName];
+    if (!pathParams) {
+      return { args: rawArgs };
+    }
+
+    const args = this.normalizeParameters(rawArgs ?? {});
+    if (typeof args.projectPath !== 'string' || !args.projectPath || !this.validatePath(args.projectPath)) {
+      return { args };
+    }
+
+    for (const key of pathParams) {
+      if (args[key] === undefined || args[key] === null || args[key] === '') {
+        continue;
+      }
+      const result = this.resolveInsideProject(args.projectPath, args[key]);
+      if ('error' in result) {
+        return {
+          error: this.createErrorResponse(result.error, [
+            'Use a path relative to the project directory, for example scenes/main.tscn',
+          ]),
+        };
+      }
+      args[key] = result.relPath;
+    }
+    return { args };
+  }
+
+  /**
+   * List files under a directory whose extension is in the given list. Hidden entries
+   * such as .godot/ and .git/ are skipped. Paths are relative to rootDir, with forward slashes.
+   */
+  private listProjectFiles(dir: string, rootDir: string, extensions: string[], found: string[] = []): string[] {
+    if (!existsSync(dir)) {
+      return found;
+    }
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name.startsWith('.')) continue;
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        this.listProjectFiles(fullPath, rootDir, extensions, found);
+      } else if (entry.isFile()) {
+        const extension = entry.name.split('.').pop()?.toLowerCase() ?? '';
+        if (extensions.includes(extension)) {
+          found.push(relative(rootDir, fullPath).replace(/\\/g, '/'));
+        }
+      }
+    }
+    return found;
+  }
+
+  /**
+   * Handle the diagnose_project tool: report what is needed for the project to load its resources.
+   */
+  private async handleDiagnoseProject(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (typeof args.projectPath !== 'string' || !args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    const projectRoot = resolvePath(args.projectPath);
+    const checks: { name: string; status: 'ok' | 'warn' | 'error'; detail: string }[] = [];
+    const add = (name: string, status: 'ok' | 'warn' | 'error', detail: string) => {
+      checks.push({ name, status, detail });
+    };
+
+    // 1. Godot executable and version
+    let godotVersion: string | undefined;
+    try {
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+      }
+      if (!this.godotPath) {
+        add('godot_executable', 'error', 'No Godot executable found. Set GODOT_PATH to its full path.');
+      } else {
+        const { stdout } = await execFileAsync(this.godotPath, ['--version']);
+        godotVersion = stdout.trim();
+        add('godot_executable', 'ok', this.godotPath);
+        const major = Number(/^(\d+)/.exec(godotVersion)?.[1]);
+        add(
+          'godot_version',
+          major === 4 ? 'ok' : 'warn',
+          major === 4 ? godotVersion : `${godotVersion} (this server is written for Godot 4)`
+        );
+      }
+    } catch (error: any) {
+      add('godot_executable', 'error', error?.message || 'Could not run Godot --version');
+    }
+
+    // 2. project.godot
+    const projectFile = join(projectRoot, 'project.godot');
+    if (!existsSync(projectFile)) {
+      add('project_file', 'error', `No project.godot in ${args.projectPath}`);
+    } else {
+      const name = /config\/name="([^"]*)"/.exec(readFileSync(projectFile, 'utf8'))?.[1];
+      add('project_file', 'ok', name ? `Project "${name}"` : 'project.godot found');
+    }
+
+    // 3. Optional import run (writes .import files and the import cache)
+    if (args.runImport === true && godotVersion && this.godotPath) {
+      const importOutput = await this.runGodotImport(projectRoot);
+      add(
+        'import_run',
+        importOutput === undefined ? 'ok' : 'error',
+        importOutput === undefined ? 'Import finished without errors' : importOutput.slice(0, 300)
+      );
+    }
+
+    // 4. Import cache
+    const importedDir = join(projectRoot, '.godot', 'imported');
+    const importedCount = existsSync(importedDir) ? readdirSync(importedDir).length : 0;
+    add(
+      'import_cache',
+      importedCount > 0 ? 'ok' : 'warn',
+      importedCount > 0 ? `${importedCount} entries in .godot/imported` : 'Nothing is imported yet (.godot/imported is empty or missing)'
+    );
+
+    // 5. Importable assets without a .import file
+    const assets = this.listProjectFiles(projectRoot, projectRoot, IMPORTABLE_EXTENSIONS);
+    const missingImport = assets.filter((asset) => !existsSync(join(projectRoot, `${asset}.import`)));
+    add(
+      'import_files',
+      missingImport.length === 0 ? 'ok' : 'warn',
+      missingImport.length === 0
+        ? (assets.length === 0 ? 'No importable assets found' : `${assets.length} importable assets, all with a .import file`)
+        : `${missingImport.length} of ${assets.length} importable assets have no .import file, so Godot cannot load them. Example: ${missingImport[0]}`
+    );
+
+    // 6. .import files whose imported output is missing
+    const importFiles = this.listProjectFiles(projectRoot, projectRoot, ['import']);
+    const brokenImports = importFiles.filter((file) => {
+      const target = /^path="res:\/\/([^"]+)"/m.exec(readFileSync(join(projectRoot, file), 'utf8'))?.[1];
+      return target !== undefined && !existsSync(join(projectRoot, target));
+    });
+    add(
+      'import_outputs',
+      brokenImports.length === 0 ? 'ok' : 'warn',
+      brokenImports.length === 0
+        ? `${importFiles.length} .import files with their outputs present`
+        : `${brokenImports.length} .import files point to missing outputs, so they need re-importing. Example: ${brokenImports[0]}`
+    );
+
+    if ((missingImport.length > 0 || brokenImports.length > 0) && args.runImport !== true) {
+      add('recommendation', 'warn', 'Run diagnose_project with runImport set to true, or run: godot --headless --path <project> --import');
+    }
+
+    const lines = checks.map((c) => `[${c.status}] ${c.name}: ${c.detail}`);
+    const details = {
+      checks,
+      importableAssets: assets.length,
+      missingImport: missingImport.slice(0, 50),
+      brokenImports: brokenImports.slice(0, 50),
+    };
+
+    return {
+      content: [
+        { type: 'text', text: lines.join('\n') },
+        { type: 'text', text: JSON.stringify(details, null, 2) },
+      ],
+      isError: checks.some((c) => c.status === 'error'),
+    };
+  }
+
+  /**
+   * Parse the text of a .tscn file into its nodes, external resources and sub-resources.
+   * Handles the format Godot writes: a section header with attributes, then "key = value"
+   * lines that belong to the latest section. Each node's path is "<root>/<child>/...".
+   */
+  private parseSceneText(text: string): {
+    format: string;
+    root: SceneNodeInfo | null;
+    nodeCount: number;
+    extResources: { id: string; type: string; path: string }[];
+    subResources: { id: string; type: string; properties: Record<string, string> }[];
+    orphanNodes: string[];
+  } {
+    const parseAttributes = (raw: string): Record<string, string> => {
+      const attributes: Record<string, string> = {};
+      for (const match of raw.matchAll(/(\w+)=("(?:[^"\\]|\\.)*"|[^\s\]]+)/g)) {
+        attributes[match[1]] = match[2].replace(/^"|"$/g, '');
+      }
+      return attributes;
+    };
+
+    const nodes: SceneNodeInfo[] = [];
+    const extResources: { id: string; type: string; path: string }[] = [];
+    const subResources: { id: string; type: string; properties: Record<string, string> }[] = [];
+    let format = '';
+    let current: { properties: Record<string, string> } | null = null;
+
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (line === '') {
+        continue;
+      }
+
+      const header = /^\[(\w+)(.*)\]$/.exec(line);
+      if (header) {
+        const kind = header[1];
+        const attributes = parseAttributes(header[2]);
+        current = null;
+
+        if (kind === 'gd_scene') {
+          format = attributes.format ?? '';
+        } else if (kind === 'ext_resource') {
+          extResources.push({ id: attributes.id ?? '', type: attributes.type ?? '', path: attributes.path ?? '' });
+        } else if (kind === 'sub_resource') {
+          const sub = { id: attributes.id ?? '', type: attributes.type ?? '', properties: {} as Record<string, string> };
+          subResources.push(sub);
+          current = sub;
+        } else if (kind === 'node') {
+          const node: SceneNodeInfo = {
+            name: attributes.name ?? '',
+            type: attributes.type ?? null,
+            parent: attributes.parent ?? null,
+            instance: attributes.instance ?? null,
+            path: '',
+            properties: {},
+            children: [],
+          };
+          nodes.push(node);
+          current = node;
+        }
+        continue;
+      }
+
+      const property = /^([^=\s]+)\s*=\s*(.*)$/.exec(line);
+      if (property && current) {
+        current.properties[property[1]] = property[2].slice(0, 300);
+      }
+    }
+
+    const root = nodes.find((node) => node.parent === null) ?? null;
+    const orphanNodes: string[] = [];
+    if (root) {
+      root.path = root.name;
+      // Nodes are keyed by their path relative to the root; the root itself is ''.
+      const byRelativePath = new Map<string, SceneNodeInfo>([['', root]]);
+      for (const node of nodes) {
+        if (node === root) {
+          continue;
+        }
+        const parentKey = node.parent === '.' ? '' : (node.parent ?? '');
+        const parentNode = byRelativePath.get(parentKey);
+        if (!parentNode) {
+          orphanNodes.push(node.name);
+          continue;
+        }
+        const relativeKey = parentKey === '' ? node.name : `${parentKey}/${node.name}`;
+        node.path = `${root.name}/${relativeKey}`;
+        parentNode.children.push(node);
+        byRelativePath.set(relativeKey, node);
+      }
+    }
+
+    return { format, root, nodeCount: nodes.length, extResources, subResources, orphanNodes };
+  }
+
+  /**
+   * Handle the read_scene tool: return the node tree of a .tscn scene file.
+   */
+  private async handleReadScene(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (typeof args.projectPath !== 'string' || !args.projectPath || typeof args.scenePath !== 'string' || !args.scenePath) {
+      return this.createErrorResponse(
+        'Project path and scene path are required',
+        ['Provide projectPath and scenePath (relative to the project)']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide valid paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    const projectRoot = resolvePath(args.projectPath);
+    const sceneFile = join(projectRoot, args.scenePath);
+    if (!existsSync(sceneFile) || !statSync(sceneFile).isFile()) {
+      return this.createErrorResponse(
+        `Scene file not found: ${args.scenePath}`,
+        ['Check the path relative to the project directory', 'Use create_scene to create a new scene']
+      );
+    }
+
+    const parsed = this.parseSceneText(readFileSync(sceneFile, 'utf8'));
+    if (!parsed.root) {
+      return this.createErrorResponse(
+        `No root node found in ${args.scenePath}`,
+        ['The file may be empty or not a Godot scene']
+      );
+    }
+
+    // A readable outline first, then the full structure for programmatic use.
+    const outline: string[] = [];
+    const walk = (node: SceneNodeInfo, depth: number) => {
+      outline.push(`${'  '.repeat(depth)}- ${node.name} (${node.type ?? (node.instance ? 'instance' : 'unknown')}) ${node.path}`);
+      for (const child of node.children) {
+        walk(child, depth + 1);
+      }
+    };
+    walk(parsed.root, 0);
+
+    const summary = [
+      `Scene ${args.scenePath}: ${parsed.nodeCount} nodes, ${parsed.extResources.length} external resources, ${parsed.subResources.length} sub-resources`,
+      ...outline,
+    ];
+    if (parsed.orphanNodes.length > 0) {
+      summary.push('', `Nodes whose parent was not found: ${parsed.orphanNodes.join(', ')}`);
+    }
+
+    return {
+      content: [
+        { type: 'text', text: summary.join('\n') },
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              format: parsed.format,
+              root: parsed.root,
+              extResources: parsed.extResources,
+              subResources: parsed.subResources,
+              orphanNodes: parsed.orphanNodes,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+
+  /**
+   * Handle the set_node_property tool: change one property on a node and save the scene.
+   */
+  private async handleSetNodeProperty(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (
+      typeof args.projectPath !== 'string' || !args.projectPath ||
+      typeof args.scenePath !== 'string' || !args.scenePath ||
+      typeof args.nodePath !== 'string' || !args.nodePath ||
+      typeof args.property !== 'string' || !args.property ||
+      typeof args.value !== 'string'
+    ) {
+      return this.createErrorResponse(
+        'Missing required parameters',
+        ['Provide projectPath, scenePath, nodePath, property, and value (value is a Godot literal, such as 42 or Vector2(1, 2))']
+      );
+    }
+
+    if (
+      !this.validatePath(args.projectPath) ||
+      !this.validatePath(args.scenePath) ||
+      !this.validatePath(args.nodePath)
+    ) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide valid paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    if (!/^[A-Za-z_][\w/]*$/.test(args.property)) {
+      return this.createErrorResponse(
+        `Invalid property name: ${args.property}`,
+        ['Use a property name such as position, texture or metadata/key']
+      );
+    }
+
+    const projectRoot = resolvePath(args.projectPath);
+    if (!existsSync(join(projectRoot, 'project.godot'))) {
+      return this.createErrorResponse(
+        `Not a valid Godot project: ${args.projectPath}`,
+        ['Ensure the path points to a directory containing a project.godot file']
+      );
+    }
+
+    if (!existsSync(join(projectRoot, args.scenePath))) {
+      return this.createErrorResponse(
+        `Scene file not found: ${args.scenePath}`,
+        ['Check the path relative to the project directory']
+      );
+    }
+
+    try {
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+        if (!this.godotPath) {
+          return this.createErrorResponse(
+            'Could not find a valid Godot executable path',
+            [
+              'Ensure Godot is installed correctly',
+              'Set GODOT_PATH environment variable to specify the correct path',
+            ]
+          );
+        }
+      }
+
+      const { stdout, stderr } = await this.executeOperation(
+        'set_node_property',
+        {
+          scenePath: args.scenePath,
+          nodePath: args.nodePath,
+          property: args.property,
+          value: args.value,
+        },
+        args.projectPath
+      );
+
+      const failure = `${stdout}\n${stderr}`.split(/\r?\n/).find((line) => line.includes('Failed to'));
+      if (failure) {
+        return this.createErrorResponse(
+          failure.trim(),
+          [
+            'Check the node path with read_scene (it starts with the root name, for example root/Player)',
+            'Check that the value is a valid Godot literal, such as 42, true, "text" or Vector2(1, 2)',
+          ]
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Set ${args.property} on ${args.nodePath} in ${args.scenePath} and saved the scene.`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to set property: ${error?.message || 'Unknown error'}`,
         ['Ensure Godot is installed and GODOT_PATH is set correctly']
       );
     }

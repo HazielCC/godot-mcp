@@ -171,6 +171,9 @@ Use this configuration:
 | `check_script` | Checks one `.gd` file for syntax errors without running the project, with file and line |
 | `check_project_scripts` | Checks every `.gd` file in a project for syntax errors (one Godot process per file) |
 | `run_tests` | Runs the GUT tests headless and returns totals, each failing test with its message, and script errors. Options: `directory`, `select` (script file name), `testName`, `importFirst`, `timeoutMs` |
+| `diagnose_project` | Checks the Godot executable and version, the project file, the import cache, importable assets without a `.import` file, and `.import` files with missing outputs. Option: `runImport` |
+| `read_scene` | Reads a `.tscn` scene as a node tree, with each node's type, path (such as `root/Player`), and properties |
+| `set_node_property` | Sets one property on a node of an existing scene and saves it. The value is a Godot literal, such as `Vector2(1, 2)` |
 
 ## Building from source
 

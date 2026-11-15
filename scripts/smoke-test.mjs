@@ -27,6 +27,9 @@ const EXPECTED_TOOLS = [
   'check_script',
   'check_project_scripts',
   'run_tests',
+  'diagnose_project',
+  'read_scene',
+  'set_node_property',
 ];
 
 const TIMEOUT_MS = 15000;
