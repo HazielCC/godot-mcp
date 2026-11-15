@@ -1238,6 +1238,13 @@ func inspect_node(params: Dictionary) -> void:
                 quit(1)
                 return
             print("EXPECTED " + var_to_str(expected))
+        if params.has("apply_in_memory") and params.has("value"):
+            # Apply the value to the in-memory node only. Godot then computes the derived
+            # transform (position, rotation and scale all live in it), which is printed so the
+            # caller can write it to the scene file. Nothing is saved here.
+            node.set(property_name, str_to_var(str(params.value)))
+            if _has_property(node, "transform"):
+                print("TRANSFORM " + var_to_str(node.get("transform")))
         var current: Variant = node.get(property_name)
         print("VALUE " + var_to_str(current))
         if params.has("check_has_value"):
