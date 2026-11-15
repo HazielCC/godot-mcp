@@ -848,23 +848,26 @@ func export_mesh_library(params):
         
         if error == OK:
             # Verify the file was actually created
+            var file_created = FileAccess.file_exists(full_output_path)
             if debug_mode:
-                var file_check_after = FileAccess.file_exists(full_output_path)
-                print("File exists check after save: " + str(file_check_after))
-                
-                if file_check_after:
-                    print("MeshLibrary exported successfully with " + str(item_id) + " items to: " + full_output_path)
+                print("File exists check after save: " + str(file_created))
+
+            if file_created:
+                print("MeshLibrary exported successfully with " + str(item_id) + " items to: " + full_output_path)
+                if debug_mode:
                     # Get the absolute path for reference
                     var absolute_path = ProjectSettings.globalize_path(full_output_path)
                     print("Absolute file path: " + absolute_path)
-                else:
-                    printerr("File reported as saved but does not exist at: " + full_output_path)
             else:
-                print("MeshLibrary exported successfully with " + str(item_id) + " items to: " + full_output_path)
+                printerr("Failed to export MeshLibrary: file was not created at " + full_output_path)
+                quit(1)
         else:
             printerr("Failed to save MeshLibrary: " + str(error))
+            quit(1)
     else:
-        printerr("No valid meshes found in the scene")
+        # Exit with an error so the TypeScript side reports a failure
+        printerr("Failed to export MeshLibrary: no valid meshes found in the scene")
+        quit(1)
 
 # Find files with a specific extension recursively
 func find_files(path, extension):

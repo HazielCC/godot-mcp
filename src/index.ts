@@ -1840,6 +1840,21 @@ class GodotServer {
         );
       }
 
+      // Godot can fail (for example, when the scene has no meshes) without writing
+      // "Failed to" to stderr, and executeOperation does not expose the exit code.
+      // Confirm the file exists before reporting success.
+      const outputFile = join(args.projectPath, String(args.outputPath).replace(/^res:\/\//, ''));
+      if (!existsSync(outputFile)) {
+        return this.createErrorResponse(
+          `Failed to export mesh library: no file was created at ${args.outputPath}`,
+          [
+            'Check that the scene contains at least one MeshInstance3D with a mesh assigned',
+            'Ensure the output path is valid',
+            'Verify the scene file is valid',
+          ]
+        );
+      }
+
       return {
         content: [
           {
