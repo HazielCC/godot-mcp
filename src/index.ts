@@ -120,6 +120,7 @@ class GodotServer {
   private activeProcess: GodotProcess | null = null;
   private godotPath: string | null = null;
   private operationsScriptPath: string;
+  private checkScriptsPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
 
@@ -187,6 +188,7 @@ class GodotServer {
 
     // Set the path to the operations script
     this.operationsScriptPath = join(__dirname, 'scripts', 'godot_operations.gd');
+    this.checkScriptsPath = join(__dirname, 'scripts', 'check_scripts.gd');
     if (debugMode) console.error(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
 
     // Initialize the MCP server
@@ -988,7 +990,7 @@ class GodotServer {
         },
         {
           name: 'check_script',
-          description: 'Check one GDScript file for syntax and parse errors without running the project. Returns each error with its file and line. Does not detect errors that depend on classes defined in other files.',
+          description: 'Check one GDScript file for parse and compile errors, loading it in the project context (autoloads and global classes resolve). Returns each error with its file and line, without running the game.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1006,7 +1008,7 @@ class GodotServer {
         },
         {
           name: 'check_project_scripts',
-          description: 'Check every GDScript file in a Godot project for parse errors without running it. Starts one Godot process per file, so it can be slow on large projects. Does not detect errors that depend on classes defined in other files.',
+          description: 'Check every GDScript file in a Godot project for parse and compile errors, in the project context (autoloads and global classes resolve), without running the game. One Godot process checks the whole project.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1601,30 +1603,31 @@ class GodotServer {
   }
 
   /**
-   * Run `godot --check-only` on one script.
+   * Load one script (resScriptPath), or every script in the project when it is omitted,
+   * with scripts/check_scripts.gd. That runs after the project's autoloads are registered,
+   * so the checks match the context the game uses: autoload names and global classes resolve.
    * executeOperation ignores the exit code, so this calls execFileAsync directly.
    */
   private async runCheckOnly(
     projectPath: string,
-    resScriptPath: string
+    resScriptPath?: string
   ): Promise<{
     ok: boolean;
     errors: { file: string; line: number; message: string }[];
     rawOutput: string;
+    checkedCount: number;
     // Set when Godot could not be started at all (for example, a wrong GODOT_PATH).
     executionError?: string;
   }> {
+    const userArgs = resScriptPath ? [resScriptPath] : [];
     let output = '';
     let exitCode = 0;
     try {
-      const { stdout, stderr } = await execFileAsync(this.godotPath!, [
-        '--headless',
-        '--path',
-        projectPath,
-        '--check-only',
-        '--script',
-        resScriptPath,
-      ]);
+      const { stdout, stderr } = await execFileAsync(
+        this.godotPath!,
+        ['--headless', '--path', projectPath, '--script', this.checkScriptsPath, '--', ...userArgs],
+        { timeout: 900000, maxBuffer: 64 * 1024 * 1024 }
+      );
       output = `${stdout ?? ''}\n${stderr ?? ''}`;
     } catch (error: any) {
       // A numeric code is Godot's exit status. A string code (such as ENOENT) means
@@ -1634,6 +1637,7 @@ class GodotServer {
           ok: false,
           errors: [],
           rawOutput: '',
+          checkedCount: 0,
           executionError: error?.message || 'Unknown error starting Godot',
         };
       }
@@ -1642,10 +1646,18 @@ class GodotServer {
     }
 
     const errors = this.parseScriptErrors(output);
+    // A file Godot cannot load at all has no SCRIPT ERROR line; report it as an error too.
+    for (const match of output.matchAll(/CHECK_FAIL (res:\/\/\S+)/g)) {
+      if (!errors.some((e) => e.file === match[1])) {
+        errors.push({ file: match[1], line: 0, message: 'Godot could not load this file' });
+      }
+    }
+    const checkedCount = Number(/CHECK_DONE total=(\d+)/.exec(output)?.[1] ?? 0);
     return {
       ok: exitCode === 0 && errors.length === 0,
       errors,
       rawOutput: output.trim(),
+      checkedCount,
     };
   }
 
@@ -1667,23 +1679,6 @@ class GodotServer {
       .filter((line) => line.trim() !== '' && !line.startsWith('Godot Engine v'))
       .join('\n');
     return `Godot could not check ${label}:\n${useful ? useful.slice(0, 1500) : '(Godot printed no output)'}`;
-  }
-
-  /**
-   * Recursively list .gd files relative to rootDir.
-   * Skips hidden entries such as .godot/ and .git/.
-   */
-  private findGdScripts(dir: string, rootDir: string, found: string[] = []): string[] {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name.startsWith('.')) continue;
-      const fullPath = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        this.findGdScripts(fullPath, rootDir, found);
-      } else if (entry.isFile() && entry.name.endsWith('.gd')) {
-        found.push(relative(rootDir, fullPath).replace(/\\/g, '/'));
-      }
-    }
-    return found;
   }
 
   /**
@@ -1851,45 +1846,50 @@ class GodotServer {
         }
       }
 
-      const scripts = this.findGdScripts(projectRoot, projectRoot);
-      if (scripts.length === 0) {
+      // One Godot process checks the whole project, with the autoloads registered.
+      const result = await this.runCheckOnly(projectRoot);
+      if (result.executionError) {
+        return this.createErrorResponse(
+          `Failed to run Godot: ${result.executionError}`,
+          [
+            'Set GODOT_PATH to the full path of a Godot executable',
+            'Check that Godot runs from a terminal with --version',
+          ]
+        );
+      }
+      if (result.checkedCount === 0 && result.errors.length === 0) {
         return {
           content: [{ type: 'text', text: 'No GDScript files found in the project.' }],
         };
       }
-
-      const failures: { script: string; errors: { file: string; line: number; message: string }[]; rawOutput: string }[] = [];
-      for (const script of scripts) {
-        const result = await this.runCheckOnly(projectRoot, `res://${script}`);
-        if (result.executionError) {
-          // Godot did not start, so every remaining file would fail the same way.
-          return this.createErrorResponse(
-            `Failed to run Godot: ${result.executionError}`,
-            [
-              'Set GODOT_PATH to the full path of a Godot executable',
-              'Check that Godot runs from a terminal with --version',
-            ]
-          );
-        }
-        if (!result.ok) {
-          failures.push({ script, errors: result.errors, rawOutput: result.rawOutput });
-        }
-      }
-
-      if (failures.length === 0) {
+      if (result.ok) {
         return {
-          content: [{ type: 'text', text: `OK: checked ${scripts.length} GDScript files, no parse errors.` }],
+          content: [{ type: 'text', text: `OK: checked ${result.checkedCount} GDScript files, no parse errors.` }],
         };
       }
 
-      const details = failures
-        .map((f) => this.formatCheckFailure(f.script, f))
+      // Group the errors by file, in the order Godot reported them.
+      const byFile = new Map<string, { file: string; line: number; message: string }[]>();
+      for (const error of result.errors) {
+        const list = byFile.get(error.file) ?? [];
+        list.push(error);
+        byFile.set(error.file, list);
+      }
+      if (byFile.size === 0) {
+        // Godot failed without a recognized error: show its output instead of hiding it.
+        return {
+          content: [{ type: 'text', text: this.formatCheckFailure('the project', result) }],
+          isError: true,
+        };
+      }
+      const details = [...byFile.entries()]
+        .map(([file, errors]) => this.formatCheckFailure(file.replace('res://', ''), { errors, rawOutput: '' }))
         .join('\n\n');
       return {
         content: [
           {
             type: 'text',
-            text: `Checked ${scripts.length} GDScript files: ${failures.length} with errors.\n\n${details}`,
+            text: `Checked ${result.checkedCount} GDScript files: ${byFile.size} with errors.\n\n${details}`,
           },
         ],
         isError: true,
