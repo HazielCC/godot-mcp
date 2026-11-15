@@ -69,6 +69,8 @@ func _init() -> void:
             save_scene(params)
         "set_node_property":
             set_node_property(params)
+        "inspect_node":
+            inspect_node(params)
         "get_uid":
             get_uid(params)
         "resave_resources":
@@ -812,14 +814,8 @@ func export_mesh_library(params: Dictionary) -> void:
             if debug_mode and not collision_added:
                 print("No collision shape found for mesh: " + child.name)
 
-            # Add preview if available
-            if mesh_instance.mesh:
-                # Passed as Variant to keep the original runtime behavior. Godot expects a
-                # Texture2D here, so the preview is not set; see the PR notes.
-                var preview: Variant = mesh_instance.mesh
-                mesh_library.set_item_preview(item_id, preview)
-                if debug_mode:
-                    print("Added preview for mesh: " + child.name)
+            # No preview is set: MeshLibrary.set_item_preview expects a Texture2D, and the
+            # editor builds the item preview from the mesh itself.
 
             item_id += 1
         elif debug_mode:
@@ -1175,6 +1171,100 @@ func set_node_property(params: Dictionary) -> void:
     print("Property " + property_name + " set on " + node_path + " in " + full_scene_path)
 
 # Save changes to a scene file
+# Read-only checks used around text edits of scenes that inherit from another scene. The
+# scene is loaded and instantiated, nothing is saved. Prints one line per result:
+#   VALUE <literal>      current value of params.property on the node
+#   EXPECTED <literal>   params.value parsed as a Godot literal (same format as VALUE)
+#   HAS_VALUE 1|0        whether params.property is set (with check_has_value)
+#   IS_SPRITE 1|0        whether the node is Sprite2D, Sprite3D or TextureRect (with check_sprite)
+# and INSPECT_OK when every requested check passes. A failed check prints
+# "Failed to inspect: ..." and exits with an error.
+func inspect_node(params: Dictionary) -> void:
+    var full_scene_path: String = params.scene_path
+    if not full_scene_path.begins_with("res://"):
+        full_scene_path = "res://" + full_scene_path
+
+    var scene: PackedScene = load(full_scene_path)
+    if not scene:
+        printerr("Failed to inspect: could not load scene " + full_scene_path)
+        quit(1)
+        return
+
+    var scene_root: Node = scene.instantiate()
+    var root_name: String = str(scene_root.name)
+
+    var node: Node = null
+    if params.has("node_path"):
+        node = _find_node(scene_root, root_name, str(params.node_path))
+        if node == null:
+            printerr("Failed to inspect: node not found: " + str(params.node_path))
+            scene_root.free()
+            quit(1)
+            return
+
+    if params.has("parent_node_path"):
+        var parent: Node = _find_node(scene_root, root_name, str(params.parent_node_path))
+        if parent == null:
+            printerr("Failed to inspect: parent node not found: " + str(params.parent_node_path))
+            scene_root.free()
+            quit(1)
+            return
+        if parent.get_node_or_null(str(params.node_name)) != null:
+            printerr("Failed to inspect: a node named " + str(params.node_name) + " already exists under " + str(params.parent_node_path))
+            scene_root.free()
+            quit(1)
+            return
+
+    if params.has("node_type"):
+        var node_type: String = str(params.node_type)
+        if not ClassDB.class_exists(node_type) or not ClassDB.can_instantiate(node_type):
+            printerr("Failed to inspect: node type must be a built-in class that can be instantiated: " + node_type)
+            scene_root.free()
+            quit(1)
+            return
+
+    if params.has("property") and node != null:
+        var property_name: String = str(params.property)
+        if not _has_property(node, property_name):
+            printerr("Failed to inspect: node " + str(params.node_path) + " has no property " + property_name)
+            scene_root.free()
+            quit(1)
+            return
+        if params.has("value"):
+            var expected: Variant = str_to_var(str(params.value))
+            if expected == null and str(params.value).strip_edges() != "null":
+                printerr("Failed to inspect: value is not a valid Godot literal: " + str(params.value))
+                scene_root.free()
+                quit(1)
+                return
+            print("EXPECTED " + var_to_str(expected))
+        var current: Variant = node.get(property_name)
+        print("VALUE " + var_to_str(current))
+        if params.has("check_has_value"):
+            print("HAS_VALUE " + ("1" if current != null else "0"))
+
+    if params.has("check_sprite") and node != null:
+        var is_sprite: bool = node is Sprite2D or node is Sprite3D or node is TextureRect
+        print("IS_SPRITE " + ("1" if is_sprite else "0"))
+
+    scene_root.free()
+    print("INSPECT_OK")
+
+# Find a node from a path that starts with the root name (for example "root/Player").
+func _find_node(scene_root: Node, root_name: String, node_path: String) -> Node:
+    var relative_path: String = node_path
+    if node_path == root_name:
+        relative_path = "."
+    elif node_path.begins_with(root_name + "/"):
+        relative_path = node_path.substr(root_name.length() + 1)
+    return scene_root if relative_path == "." else scene_root.get_node_or_null(relative_path)
+
+func _has_property(node: Object, property_name: String) -> bool:
+    for info: Dictionary in node.get_property_list():
+        if str(info.name) == property_name:
+            return true
+    return false
+
 func save_scene(params: Dictionary) -> void:
     print("Saving scene: " + params.scene_path)
 

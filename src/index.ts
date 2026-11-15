@@ -9,7 +9,7 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize, resolve as resolvePath, relative, isAbsolute } from 'path';
-import { existsSync, readdirSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
@@ -36,6 +36,143 @@ const __dirname = dirname(__filename);
 /**
  * Interface representing a running Godot process
  */
+/** Attributes of a .tscn section header, such as [node name="Player" parent="."]. */
+function parseSceneAttributes(raw: string): Record<string, string> {
+  const attributes: Record<string, string> = {};
+  for (const match of raw.matchAll(/(\w+)=("(?:[^"\\]|\\.)*"|[^\s\]]+)/g)) {
+    attributes[match[1]] = match[2].replace(/^"|"$/g, '');
+  }
+  return attributes;
+}
+
+/** Key of a node relative to the scene root: '' for the root, 'Walls/WallFar' for nested nodes. */
+function sceneNodeKey(parent: string | undefined, name: string): string {
+  if (parent === undefined) {
+    return '';
+  }
+  const parentKey = parent === '.' ? '' : parent;
+  return parentKey === '' ? name : `${parentKey}/${name}`;
+}
+
+/** Key of a node from a path that starts with the root name, or null when it does not. */
+function nodeKeyFromPath(nodePath: string, rootName: string): string | null {
+  if (nodePath === rootName) {
+    return '';
+  }
+  return nodePath.startsWith(`${rootName}/`) ? nodePath.slice(rootName.length + 1) : null;
+}
+
+/** Name of the root node: the first [node] section, which has no parent. */
+function sceneRootName(text: string): string {
+  for (const line of text.split(/\r?\n/)) {
+    const header = /^\[node\s(.*)\]$/.exec(line.trim());
+    if (header) {
+      return parseSceneAttributes(header[1]).name ?? '';
+    }
+  }
+  return '';
+}
+
+/** Lines of the section of a node: its header line, up to the next section. */
+function locateNodeSection(lines: string[], key: string): { headerIndex: number; end: number } | undefined {
+  for (let i = 0; i < lines.length; i++) {
+    const header = /^\[node\s(.*)\]$/.exec(lines[i].trim());
+    if (!header) {
+      continue;
+    }
+    const attributes = parseSceneAttributes(header[1]);
+    if (sceneNodeKey(attributes.parent, attributes.name ?? '') !== key) {
+      continue;
+    }
+    let end = i + 1;
+    while (end < lines.length && !lines[end].trim().startsWith('[')) {
+      end++;
+    }
+    return { headerIndex: i, end };
+  }
+  return undefined;
+}
+
+/**
+ * Set one property in the section of a node and change nothing else in the file.
+ * A node that the scene inherits but does not override has no section, so one is added
+ * at the end that carries only the override.
+ */
+function setSceneProperty(text: string, key: string, property: string, literal: string): string {
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const lines = text.split(/\r?\n/);
+  const assignment = `${property} = ${literal}`;
+  const section = locateNodeSection(lines, key);
+  if (!section) {
+    const segments = key.split('/');
+    const name = segments.pop() ?? '';
+    const parent = segments.length > 0 ? segments.join('/') : '.';
+    const trimmed = text.replace(/\s*$/, '');
+    return `${trimmed}${eol}${eol}[node name="${name}" parent="${parent}"]${eol}${assignment}${eol}`;
+  }
+  const escaped = property.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+  const pattern = new RegExp(`^${escaped}\\s*=`);
+  for (let i = section.headerIndex + 1; i < section.end; i++) {
+    if (pattern.test(lines[i])) {
+      lines[i] = assignment;
+      return lines.join(eol);
+    }
+  }
+  lines.splice(section.headerIndex + 1, 0, assignment);
+  return lines.join(eol);
+}
+
+/** Append a node section that has a name, a type and a parent, and no properties. */
+function appendNodeSection(text: string, name: string, type: string, parent: string): string {
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const trimmed = text.replace(/\s*$/, '');
+  return `${trimmed}${eol}${eol}[node name="${name}" type="${type}" parent="${parent}"]${eol}`;
+}
+
+/** Add an external resource declaration and return its id. An existing declaration is reused. */
+function addExternalResource(text: string, type: string, path: string): { text: string; id: string } {
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const lines = text.split(/\r?\n/);
+  for (const line of lines) {
+    if (line.startsWith('[ext_resource')) {
+      const attributes = parseSceneAttributes(line.slice('[ext_resource'.length, -1));
+      if (attributes.type === type && attributes.path === path && attributes.id) {
+        return { text, id: attributes.id };
+      }
+    }
+  }
+  const count = lines.filter((line) => line.startsWith('[ext_resource')).length;
+  const id = `${count + 1}_${Math.random().toString(36).slice(2, 7)}`;
+  const declaration = `[ext_resource type="${type}" path="${path}" id="${id}"]`;
+  let last = -1;
+  lines.forEach((line, i) => {
+    if (line.startsWith('[ext_resource')) {
+      last = i;
+    }
+  });
+  if (last >= 0) {
+    lines.splice(last + 1, 0, declaration);
+  } else {
+    const header = lines.findIndex((line) => line.startsWith('[gd_scene'));
+    lines.splice(header + 1, 0, '', declaration);
+  }
+  return { text: lines.join(eol), id };
+}
+
+/** Godot literal for a plain JSON value, or null when the value needs a resource or an object. */
+function toGodotLiteral(value: unknown): string | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value === 'boolean') {
+    return value ? 'true' : 'false';
+  }
+  if (typeof value === 'string' && !value.startsWith('res://') && !/[\r\n]/.test(value)) {
+    return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  }
+  return null;
+}
+
 /** A node read from a .tscn file (see read_scene). */
 interface SceneNodeInfo {
   name: string;
@@ -46,6 +183,9 @@ interface SceneNodeInfo {
   path: string;
   properties: Record<string, string>;
   children: SceneNodeInfo[];
+  // "scene": defined in this file. "inherited": from the base scene. "overridden": from the
+  // base scene, with properties changed in this file.
+  origin: 'scene' | 'inherited' | 'overridden';
 }
 
 /** Maximum lines kept per output stream (stdout and stderr) of a running Godot process. */
@@ -69,12 +209,6 @@ const PROJECT_PATH_PARAMS: Record<string, string[]> = {
   set_node_property: ['scenePath'],
 };
 
-/**
- * Tools that load a scene, change it, and save it again. They cannot save a scene that
- * inherits from another scene: the operations script drops the inherited content (see
- * scopeProjectPaths).
- */
-const SCENE_REPACKING_TOOLS = ['add_node', 'load_sprite', 'save_scene', 'set_node_property'];
 
 /** Extensions Godot imports into a .import file and a cached resource (see diagnose_project). */
 const IMPORTABLE_EXTENSIONS = [
@@ -91,6 +225,8 @@ interface GodotProcess {
   droppedErrorLines: number;
   // Script errors found in dropped lines, so trimming does not lose them.
   archivedScriptErrors: { file: string; line: number; message: string }[];
+  // Same for WARNING blocks (GDScript warnings such as shadowed variables).
+  archivedScriptWarnings: { file: string; line: number; message: string }[];
 }
 
 /**
@@ -118,6 +254,7 @@ class GodotServer {
   private activeProcess: GodotProcess | null = null;
   private godotPath: string | null = null;
   private operationsScriptPath: string;
+  private checkScriptsPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
 
@@ -185,6 +322,7 @@ class GodotServer {
 
     // Set the path to the operations script
     this.operationsScriptPath = join(__dirname, 'scripts', 'godot_operations.gd');
+    this.checkScriptsPath = join(__dirname, 'scripts', 'check_scripts.gd');
     if (debugMode) console.error(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
 
     // Initialize the MCP server
@@ -762,7 +900,7 @@ class GodotServer {
         },
         {
           name: 'get_debug_output',
-          description: 'Get the current debug output and errors. Also returns script errors (file, line, message, count) parsed from Godot output, with repeated errors grouped.',
+          description: 'Get the current debug output and errors. Also returns script errors and script warnings (file, line, message, count) parsed from Godot output, with repeated messages grouped.',
           inputSchema: {
             type: 'object',
             properties: {},
@@ -986,7 +1124,7 @@ class GodotServer {
         },
         {
           name: 'check_script',
-          description: 'Check one GDScript file for syntax and parse errors without running the project. Returns each error with its file and line. Does not detect errors that depend on classes defined in other files.',
+          description: 'Check one GDScript file for parse and compile errors, loading it in the project context (autoloads and global classes resolve). Returns each error with its file and line, without running the game.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1004,7 +1142,7 @@ class GodotServer {
         },
         {
           name: 'check_project_scripts',
-          description: 'Check every GDScript file in a Godot project for parse errors without running it. Starts one Godot process per file, so it can be slow on large projects. Does not detect errors that depend on classes defined in other files.',
+          description: 'Check every GDScript file in a Godot project for parse and compile errors, in the project context (autoloads and global classes resolve), without running the game. One Godot process checks the whole project.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1145,13 +1283,13 @@ class GodotServer {
         case 'create_scene':
           return await this.handleCreateScene(request.params.arguments);
         case 'add_node':
-          return await this.handleAddNode(request.params.arguments);
+          return (await this.handleInheritedScene('add_node', request.params.arguments)) ?? (await this.handleAddNode(request.params.arguments));
         case 'load_sprite':
-          return await this.handleLoadSprite(request.params.arguments);
+          return (await this.handleInheritedScene('load_sprite', request.params.arguments)) ?? (await this.handleLoadSprite(request.params.arguments));
         case 'export_mesh_library':
           return await this.handleExportMeshLibrary(request.params.arguments);
         case 'save_scene':
-          return await this.handleSaveScene(request.params.arguments);
+          return (await this.handleInheritedScene('save_scene', request.params.arguments)) ?? (await this.handleSaveScene(request.params.arguments));
         case 'get_uid':
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
@@ -1167,7 +1305,7 @@ class GodotServer {
         case 'read_scene':
           return await this.handleReadScene(request.params.arguments);
         case 'set_node_property':
-          return await this.handleSetNodeProperty(request.params.arguments);
+          return (await this.handleInheritedScene('set_node_property', request.params.arguments)) ?? (await this.handleSetNodeProperty(request.params.arguments));
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -1273,7 +1411,7 @@ class GodotServer {
     // dropped part would end in the middle of a block, and the block could not be archived.
     let cut = excess;
     for (let i = excess; i < buffer.length; i++) {
-      if (/^\s*(?:SCRIPT )?ERROR: /.test(buffer[i])) {
+      if (/^\s*(?:SCRIPT )?(?:ERROR|WARNING): /.test(buffer[i])) {
         cut = i;
         break;
       }
@@ -1289,6 +1427,11 @@ class GodotServer {
     session.archivedScriptErrors.push(...this.parseScriptErrors(dropped.join('\n')));
     if (session.archivedScriptErrors.length > MAX_ARCHIVED_SCRIPT_ERRORS) {
       session.archivedScriptErrors.splice(0, session.archivedScriptErrors.length - MAX_ARCHIVED_SCRIPT_ERRORS);
+    }
+
+    session.archivedScriptWarnings.push(...this.parseScriptWarnings(dropped.join('\n')));
+    if (session.archivedScriptWarnings.length > MAX_ARCHIVED_SCRIPT_ERRORS) {
+      session.archivedScriptWarnings.splice(0, session.archivedScriptWarnings.length - MAX_ARCHIVED_SCRIPT_ERRORS);
     }
   }
 
@@ -1362,6 +1505,7 @@ class GodotServer {
         droppedOutputLines: 0,
         droppedErrorLines: 0,
         archivedScriptErrors: [],
+        archivedScriptWarnings: [],
       };
 
       process.stdout?.on('data', (data: Buffer) => {
@@ -1463,6 +1607,10 @@ class GodotServer {
       ...this.activeProcess.archivedScriptErrors,
       ...this.parseScriptErrors([...this.activeProcess.output, ...this.activeProcess.errors].join('\n')),
     ]);
+    const scriptWarnings = this.groupScriptErrors([
+      ...this.activeProcess.archivedScriptWarnings,
+      ...this.parseScriptWarnings([...this.activeProcess.output, ...this.activeProcess.errors].join('\n')),
+    ]);
 
     return {
       content: [
@@ -1475,6 +1623,8 @@ class GodotServer {
               droppedOutputLines: this.activeProcess.droppedOutputLines,
               droppedErrorLines: this.activeProcess.droppedErrorLines,
               ...scriptErrors,
+              scriptWarnings: scriptWarnings.scriptErrors,
+              scriptWarningsOmitted: scriptWarnings.scriptErrorsOmitted,
             },
             null,
             2
@@ -1506,6 +1656,10 @@ class GodotServer {
       ...this.activeProcess.archivedScriptErrors,
       ...this.parseScriptErrors([...output, ...errors].join('\n')),
     ]);
+    const scriptWarnings = this.groupScriptErrors([
+      ...this.activeProcess.archivedScriptWarnings,
+      ...this.parseScriptWarnings([...output, ...errors].join('\n')),
+    ]);
     const droppedOutputLines = this.activeProcess.droppedOutputLines;
     const droppedErrorLines = this.activeProcess.droppedErrorLines;
     this.activeProcess = null;
@@ -1522,6 +1676,8 @@ class GodotServer {
               droppedOutputLines,
               droppedErrorLines,
               ...scriptErrors,
+              scriptWarnings: scriptWarnings.scriptErrors,
+              scriptWarningsOmitted: scriptWarnings.scriptErrorsOmitted,
             },
             null,
             2
@@ -1566,30 +1722,46 @@ class GodotServer {
   }
 
   /**
-   * Run `godot --check-only` on one script.
+   * Turn Godot's WARNING output into structured warnings. Warnings from scripts look like:
+   *   WARNING: <message>
+   *   at: GDScript::reload (res://path/file.gd:<line>)
+   * Warnings without a script location (engine warnings) do not match.
+   */
+  private parseScriptWarnings(output: string): { file: string; line: number; message: string }[] {
+    const pattern = /(?<!SCRIPT )WARNING: (.+?)\r?\n\s*at: [^\n]*?\((res:\/\/[^\s:)]+):(\d+)\)/g;
+    const warnings: { file: string; line: number; message: string }[] = [];
+    for (const match of output.matchAll(pattern)) {
+      warnings.push({ message: match[1].trim(), file: match[2], line: Number(match[3]) });
+    }
+    return warnings;
+  }
+
+  /**
+   * Load one script (resScriptPath), or every script in the project when it is omitted,
+   * with scripts/check_scripts.gd. That runs after the project's autoloads are registered,
+   * so the checks match the context the game uses: autoload names and global classes resolve.
    * executeOperation ignores the exit code, so this calls execFileAsync directly.
    */
   private async runCheckOnly(
     projectPath: string,
-    resScriptPath: string
+    resScriptPath?: string
   ): Promise<{
     ok: boolean;
     errors: { file: string; line: number; message: string }[];
     rawOutput: string;
+    checkedCount: number;
     // Set when Godot could not be started at all (for example, a wrong GODOT_PATH).
     executionError?: string;
   }> {
+    const userArgs = resScriptPath ? [resScriptPath] : [];
     let output = '';
     let exitCode = 0;
     try {
-      const { stdout, stderr } = await execFileAsync(this.godotPath!, [
-        '--headless',
-        '--path',
-        projectPath,
-        '--check-only',
-        '--script',
-        resScriptPath,
-      ]);
+      const { stdout, stderr } = await execFileAsync(
+        this.godotPath!,
+        ['--headless', '--path', projectPath, '--script', this.checkScriptsPath, '--', ...userArgs],
+        { timeout: 900000, maxBuffer: 64 * 1024 * 1024 }
+      );
       output = `${stdout ?? ''}\n${stderr ?? ''}`;
     } catch (error: any) {
       // A numeric code is Godot's exit status. A string code (such as ENOENT) means
@@ -1599,6 +1771,7 @@ class GodotServer {
           ok: false,
           errors: [],
           rawOutput: '',
+          checkedCount: 0,
           executionError: error?.message || 'Unknown error starting Godot',
         };
       }
@@ -1607,10 +1780,18 @@ class GodotServer {
     }
 
     const errors = this.parseScriptErrors(output);
+    // A file Godot cannot load at all has no SCRIPT ERROR line; report it as an error too.
+    for (const match of output.matchAll(/CHECK_FAIL (res:\/\/\S+)/g)) {
+      if (!errors.some((e) => e.file === match[1])) {
+        errors.push({ file: match[1], line: 0, message: 'Godot could not load this file' });
+      }
+    }
+    const checkedCount = Number(/CHECK_DONE total=(\d+)/.exec(output)?.[1] ?? 0);
     return {
       ok: exitCode === 0 && errors.length === 0,
       errors,
       rawOutput: output.trim(),
+      checkedCount,
     };
   }
 
@@ -1632,23 +1813,6 @@ class GodotServer {
       .filter((line) => line.trim() !== '' && !line.startsWith('Godot Engine v'))
       .join('\n');
     return `Godot could not check ${label}:\n${useful ? useful.slice(0, 1500) : '(Godot printed no output)'}`;
-  }
-
-  /**
-   * Recursively list .gd files relative to rootDir.
-   * Skips hidden entries such as .godot/ and .git/.
-   */
-  private findGdScripts(dir: string, rootDir: string, found: string[] = []): string[] {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name.startsWith('.')) continue;
-      const fullPath = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        this.findGdScripts(fullPath, rootDir, found);
-      } else if (entry.isFile() && entry.name.endsWith('.gd')) {
-        found.push(relative(rootDir, fullPath).replace(/\\/g, '/'));
-      }
-    }
-    return found;
   }
 
   /**
@@ -1816,45 +1980,50 @@ class GodotServer {
         }
       }
 
-      const scripts = this.findGdScripts(projectRoot, projectRoot);
-      if (scripts.length === 0) {
+      // One Godot process checks the whole project, with the autoloads registered.
+      const result = await this.runCheckOnly(projectRoot);
+      if (result.executionError) {
+        return this.createErrorResponse(
+          `Failed to run Godot: ${result.executionError}`,
+          [
+            'Set GODOT_PATH to the full path of a Godot executable',
+            'Check that Godot runs from a terminal with --version',
+          ]
+        );
+      }
+      if (result.checkedCount === 0 && result.errors.length === 0) {
         return {
           content: [{ type: 'text', text: 'No GDScript files found in the project.' }],
         };
       }
-
-      const failures: { script: string; errors: { file: string; line: number; message: string }[]; rawOutput: string }[] = [];
-      for (const script of scripts) {
-        const result = await this.runCheckOnly(projectRoot, `res://${script}`);
-        if (result.executionError) {
-          // Godot did not start, so every remaining file would fail the same way.
-          return this.createErrorResponse(
-            `Failed to run Godot: ${result.executionError}`,
-            [
-              'Set GODOT_PATH to the full path of a Godot executable',
-              'Check that Godot runs from a terminal with --version',
-            ]
-          );
-        }
-        if (!result.ok) {
-          failures.push({ script, errors: result.errors, rawOutput: result.rawOutput });
-        }
-      }
-
-      if (failures.length === 0) {
+      if (result.ok) {
         return {
-          content: [{ type: 'text', text: `OK: checked ${scripts.length} GDScript files, no parse errors.` }],
+          content: [{ type: 'text', text: `OK: checked ${result.checkedCount} GDScript files, no parse errors.` }],
         };
       }
 
-      const details = failures
-        .map((f) => this.formatCheckFailure(f.script, f))
+      // Group the errors by file, in the order Godot reported them.
+      const byFile = new Map<string, { file: string; line: number; message: string }[]>();
+      for (const error of result.errors) {
+        const list = byFile.get(error.file) ?? [];
+        list.push(error);
+        byFile.set(error.file, list);
+      }
+      if (byFile.size === 0) {
+        // Godot failed without a recognized error: show its output instead of hiding it.
+        return {
+          content: [{ type: 'text', text: this.formatCheckFailure('the project', result) }],
+          isError: true,
+        };
+      }
+      const details = [...byFile.entries()]
+        .map(([file, errors]) => this.formatCheckFailure(file.replace('res://', ''), { errors, rawOutput: '' }))
         .join('\n\n');
       return {
         content: [
           {
             type: 'text',
-            text: `Checked ${scripts.length} GDScript files: ${failures.length} with errors.\n\n${details}`,
+            text: `Checked ${result.checkedCount} GDScript files: ${byFile.size} with errors.\n\n${details}`,
           },
         ],
         isError: true,
@@ -2227,20 +2396,6 @@ class GodotServer {
       args[key] = result.relPath;
     }
 
-    if (SCENE_REPACKING_TOOLS.includes(toolName) && typeof args.scenePath === 'string') {
-      const sceneFile = join(resolvePath(args.projectPath), args.scenePath);
-      if (this.isInheritedSceneFile(sceneFile)) {
-        return {
-          error: this.createErrorResponse(
-            `Scene ${args.scenePath} inherits from another scene. Saving it with this tool would drop the inherited content.`,
-            [
-              'Make the change in the base scene instead',
-              'Or edit this scene in the Godot editor',
-            ]
-          ),
-        };
-      }
-    }
     return { args };
   }
 
@@ -2419,6 +2574,8 @@ class GodotServer {
     extResources: { id: string; type: string; path: string }[];
     subResources: { id: string; type: string; properties: Record<string, string> }[];
     orphanNodes: string[];
+    inheritsFrom: string | null;
+    derived: { key: string; node: SceneNodeInfo }[];
   } {
     const parseAttributes = (raw: string): Record<string, string> => {
       const attributes: Record<string, string> = {};
@@ -2463,6 +2620,7 @@ class GodotServer {
             path: '',
             properties: {},
             children: [],
+            origin: 'scene',
           };
           nodes.push(node);
           current = node;
@@ -2499,7 +2657,107 @@ class GodotServer {
       }
     }
 
-    return { format, root, nodeCount: nodes.length, extResources, subResources, orphanNodes };
+    // The root's instance= attribute names the scene it inherits from (ExtResource("id")).
+    let inheritsFrom: string | null = null;
+    if (root && root.instance && root.parent === null) {
+      const resourceId = /ExtResource\("([^"]+)"\)/.exec(root.instance)?.[1];
+      const resourcePath = extResources.find((resource) => resource.id === resourceId)?.path;
+      inheritsFrom = resourcePath ? resourcePath.replace(/^res:\/\//, '') : null;
+    }
+    const derived = nodes
+      .filter((node) => node !== root)
+      .map((node) => ({ key: sceneNodeKey(node.parent ?? undefined, node.name), node }));
+
+    return { format, root, nodeCount: nodes.length, extResources, subResources, orphanNodes, inheritsFrom, derived };
+  }
+
+  /**
+   * Read a scene. When it inherits from another scene, the base scene's nodes are merged in:
+   * the base tree with this scene's overrides applied and its new nodes added. Each node
+   * comes back with an origin ("scene", "inherited" or "overridden").
+   */
+  private readSceneTree(projectRoot: string, relPath: string, depth = 0): {
+    format: string;
+    root: SceneNodeInfo | null;
+    nodeCount: number;
+    extResources: { id: string; type: string; path: string }[];
+    subResources: { id: string; type: string; properties: Record<string, string> }[];
+    orphanNodes: string[];
+    inheritsFrom: string | null;
+  } {
+    const parsed = this.parseSceneText(readFileSync(join(projectRoot, relPath), 'utf8'));
+    const base =
+      parsed.inheritsFrom && depth < 8 && existsSync(join(projectRoot, parsed.inheritsFrom))
+        ? this.readSceneTree(projectRoot, parsed.inheritsFrom, depth + 1)
+        : null;
+    if (!base || !base.root) {
+      return {
+        format: parsed.format,
+        root: parsed.root,
+        nodeCount: parsed.nodeCount,
+        extResources: parsed.extResources,
+        subResources: parsed.subResources,
+        orphanNodes: parsed.orphanNodes,
+        inheritsFrom: parsed.inheritsFrom,
+      };
+    }
+
+    const root = base.root;
+    const index = new Map<string, SceneNodeInfo>();
+    const markInherited = (node: SceneNodeInfo, key: string) => {
+      node.origin = 'inherited';
+      index.set(key, node);
+      for (const child of node.children) {
+        markInherited(child, key === '' ? child.name : `${key}/${child.name}`);
+      }
+    };
+    markInherited(root, '');
+    // An inherited scene takes its own root name; the base only supplies the nodes.
+    if (parsed.root) {
+      root.name = parsed.root.name;
+      root.properties = { ...root.properties, ...parsed.root.properties };
+    }
+
+    const orphanNodes: string[] = [];
+    for (const { key, node } of parsed.derived) {
+      const existing = index.get(key);
+      if (existing) {
+        existing.properties = { ...existing.properties, ...node.properties };
+        existing.origin = 'overridden';
+        if (node.instance) {
+          existing.instance = node.instance;
+        }
+        continue;
+      }
+      const parentKey = key.includes('/') ? key.slice(0, key.lastIndexOf('/')) : '';
+      const parentNode = index.get(parentKey);
+      if (!parentNode) {
+        orphanNodes.push(node.name);
+        continue;
+      }
+      node.origin = 'scene';
+      node.children = [];
+      parentNode.children.push(node);
+      index.set(key, node);
+    }
+
+    const assignPaths = (node: SceneNodeInfo, key: string) => {
+      node.path = key === '' ? root.name : `${root.name}/${key}`;
+      for (const child of node.children) {
+        assignPaths(child, key === '' ? child.name : `${key}/${child.name}`);
+      }
+    };
+    assignPaths(root, '');
+
+    return {
+      format: parsed.format,
+      root,
+      nodeCount: index.size,
+      extResources: parsed.extResources,
+      subResources: parsed.subResources,
+      orphanNodes,
+      inheritsFrom: parsed.inheritsFrom,
+    };
   }
 
   /**
@@ -2531,7 +2789,7 @@ class GodotServer {
       );
     }
 
-    const parsed = this.parseSceneText(readFileSync(sceneFile, 'utf8'));
+    const parsed = this.readSceneTree(projectRoot, args.scenePath);
     if (!parsed.root) {
       return this.createErrorResponse(
         `No root node found in ${args.scenePath}`,
@@ -2542,7 +2800,8 @@ class GodotServer {
     // A readable outline first, then the full structure for programmatic use.
     const outline: string[] = [];
     const walk = (node: SceneNodeInfo, depth: number) => {
-      outline.push(`${'  '.repeat(depth)}- ${node.name} (${node.type ?? (node.instance ? 'instance' : 'unknown')}) ${node.path}`);
+      const tag = node.origin === 'inherited' ? ' [inherited]' : node.origin === 'overridden' ? ' [inherited, overridden]' : '';
+      outline.push(`${'  '.repeat(depth)}- ${node.name} (${node.type ?? (node.instance ? 'instance' : 'unknown')}) ${node.path}${tag}`);
       for (const child of node.children) {
         walk(child, depth + 1);
       }
@@ -2553,6 +2812,9 @@ class GodotServer {
       `Scene ${args.scenePath}: ${parsed.nodeCount} nodes, ${parsed.extResources.length} external resources, ${parsed.subResources.length} sub-resources`,
       ...outline,
     ];
+    if (parsed.inheritsFrom) {
+      summary.splice(1, 0, `Inherits from ${parsed.inheritsFrom}; inherited nodes are shown with their origin`);
+    }
     if (parsed.orphanNodes.length > 0) {
       summary.push('', `Nodes whose parent was not found: ${parsed.orphanNodes.join(', ')}`);
     }
@@ -2680,6 +2942,295 @@ class GodotServer {
         ['Ensure Godot is installed and GODOT_PATH is set correctly']
       );
     }
+  }
+
+  /**
+   * Run the read-only inspect_node operation. A failed check comes back as `failure`.
+   */
+  private async inspectNode(
+    projectPath: string,
+    params: Record<string, unknown>
+  ): Promise<{ failure?: string; values: Record<string, string> }> {
+    const { stdout, stderr } = await this.executeOperation('inspect_node', params as any, projectPath);
+    const lines = `${stdout}\n${stderr}`.split(/\r?\n/);
+    const values: Record<string, string> = {};
+    for (const line of lines) {
+      const match = /^(VALUE|EXPECTED|HAS_VALUE|IS_SPRITE) (.*)$/.exec(line.trim());
+      if (match) {
+        values[match[1]] = match[2];
+      }
+    }
+    const failure = lines.find((line) => line.includes('Failed to inspect'));
+    if (failure) {
+      return { failure: failure.trim(), values };
+    }
+    if (!lines.some((line) => line.includes('INSPECT_OK'))) {
+      return { failure: 'Godot did not confirm the check', values };
+    }
+    return { values };
+  }
+
+  /**
+   * Check the scene after a text edit. Any failed check restores the original text, so a
+   * bad edit never stays in the file. Returns the problem, or undefined when all checks pass.
+   */
+  private async verifyOrRestore(
+    projectPath: string,
+    sceneFile: string,
+    before: string,
+    checks: { params: Record<string, unknown>; mode: 'exists' | 'equal' | 'hasValue' }[]
+  ): Promise<string | undefined> {
+    for (const check of checks) {
+      const result = await this.inspectNode(projectPath, check.params);
+      let problem = result.failure;
+      if (!problem && check.mode === 'equal' && result.values.VALUE !== result.values.EXPECTED) {
+        problem = `The property ${String(check.params.property)} did not match after the edit`;
+      }
+      if (!problem && check.mode === 'hasValue' && result.values.HAS_VALUE !== '1') {
+        problem = `The property ${String(check.params.property)} was not set after the edit`;
+      }
+      if (problem) {
+        writeFileSync(sceneFile, before);
+        return `${problem}. The scene file was restored.`;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Route a tool call on a scene that inherits from another scene. Such scenes cannot be
+   * re-packed without losing the inherited content, so their changes are written as text
+   * (only the lines that change). Returns undefined for scenes that are not inherited.
+   */
+  private async handleInheritedScene(toolName: string, args: any): Promise<any | undefined> {
+    if (typeof args?.projectPath !== 'string' || typeof args?.scenePath !== 'string') {
+      return undefined;
+    }
+    const sceneFile = join(resolvePath(args.projectPath), args.scenePath);
+    if (!this.isInheritedSceneFile(sceneFile)) {
+      return undefined;
+    }
+    try {
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+      }
+      switch (toolName) {
+        case 'set_node_property':
+          return await this.setPropertyInInheritedScene(args);
+        case 'add_node':
+          return await this.addNodeInInheritedScene(args);
+        case 'load_sprite':
+          return await this.loadSpriteInInheritedScene(args);
+        case 'save_scene':
+          return await this.saveInheritedScene(args);
+        default:
+          return undefined;
+      }
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to edit the inherited scene: ${error?.message || 'Unknown error'}`,
+        ['Ensure Godot is installed and GODOT_PATH is set correctly']
+      );
+    }
+  }
+
+  private async setPropertyInInheritedScene(args: any): Promise<any> {
+    const projectRoot = resolvePath(args.projectPath);
+    const sceneFile = join(projectRoot, args.scenePath);
+    const before = readFileSync(sceneFile, 'utf8');
+    const nodeKey = nodeKeyFromPath(String(args.nodePath), sceneRootName(before));
+    if (nodeKey === null) {
+      return this.createErrorResponse(
+        `Node path must start with the root name: ${args.nodePath}`,
+        ['Use read_scene to see the node paths']
+      );
+    }
+    if (typeof args.value !== 'string' || args.value.includes('res://') || /[\r\n]/.test(args.value)) {
+      return this.createErrorResponse(
+        'On a scene that inherits from another scene, the value must be one plain Godot literal, without res:// resources',
+        ['For textures, use load_sprite']
+      );
+    }
+
+    const check = await this.inspectNode(args.projectPath, {
+      scenePath: args.scenePath,
+      nodePath: args.nodePath,
+      property: args.property,
+      value: args.value,
+    });
+    if (check.failure) {
+      return this.createErrorResponse(check.failure, ['Check the node path and the property name with read_scene']);
+    }
+
+    writeFileSync(sceneFile, setSceneProperty(before, nodeKey, args.property, args.value));
+    const problem = await this.verifyOrRestore(args.projectPath, sceneFile, before, [
+      {
+        params: { scenePath: args.scenePath, nodePath: args.nodePath, property: args.property, value: args.value },
+        mode: 'equal',
+      },
+    ]);
+    if (problem) {
+      return this.createErrorResponse(problem, ['Check the value is a valid Godot literal for this property']);
+    }
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Set ${args.property} on ${args.nodePath} in ${args.scenePath}. The scene inherits from another scene, so only that property line changed.`,
+        },
+      ],
+    };
+  }
+
+  private async addNodeInInheritedScene(args: any): Promise<any> {
+    const projectRoot = resolvePath(args.projectPath);
+    const sceneFile = join(projectRoot, args.scenePath);
+    const before = readFileSync(sceneFile, 'utf8');
+    const rootName = sceneRootName(before);
+    const parentPath = typeof args.parentNodePath === 'string' ? args.parentNodePath : rootName;
+    const parentKey = nodeKeyFromPath(parentPath, rootName);
+    if (parentKey === null) {
+      return this.createErrorResponse(
+        `Parent path must start with the root name: ${parentPath}`,
+        ['Use read_scene to see the node paths']
+      );
+    }
+    if (typeof args.nodeName !== 'string' || !/^[^"/\\]+$/.test(args.nodeName)) {
+      return this.createErrorResponse(
+        `Invalid node name: ${String(args.nodeName)}`,
+        ['A node name cannot contain quotes, slashes or backslashes']
+      );
+    }
+    if (typeof args.nodeType !== 'string' || !args.nodeType) {
+      return this.createErrorResponse('Node type is required', ['Provide a built-in class such as Node3D']);
+    }
+
+    const parentAttribute = parentKey === '' ? '.' : parentKey;
+    const newKey = sceneNodeKey(parentAttribute, args.nodeName);
+    const properties: Record<string, unknown> = args.properties ?? {};
+    const literals: { property: string; literal: string }[] = [];
+    for (const [property, value] of Object.entries(properties)) {
+      const literal = toGodotLiteral(value);
+      if (literal === null || !/^[A-Za-z_][\w/]*$/.test(property)) {
+        return this.createErrorResponse(
+          `Property ${property} cannot be written on a scene that inherits from another scene`,
+          ['Use a number, a boolean or a plain string here, or set the property with set_node_property']
+        );
+      }
+      literals.push({ property, literal });
+    }
+
+    const check = await this.inspectNode(args.projectPath, {
+      scenePath: args.scenePath,
+      parentNodePath: parentPath,
+      nodeName: args.nodeName,
+      nodeType: args.nodeType,
+    });
+    if (check.failure) {
+      return this.createErrorResponse(check.failure, ['Check the parent path, the name and the node type']);
+    }
+
+    let text = appendNodeSection(before, args.nodeName, args.nodeType, parentAttribute);
+    for (const { property, literal } of literals) {
+      text = setSceneProperty(text, newKey, property, literal);
+    }
+    writeFileSync(sceneFile, text);
+
+    const nodePath = newKey === '' ? rootName : `${rootName}/${newKey}`;
+    const checks: { params: Record<string, unknown>; mode: 'exists' | 'equal' | 'hasValue' }[] = [
+      { params: { scenePath: args.scenePath, nodePath }, mode: 'exists' },
+      ...literals.map(({ property, literal }) => ({
+        params: { scenePath: args.scenePath, nodePath, property, value: literal },
+        mode: 'equal' as const,
+      })),
+    ];
+    const problem = await this.verifyOrRestore(args.projectPath, sceneFile, before, checks);
+    if (problem) {
+      return this.createErrorResponse(problem, ['Check the property values']);
+    }
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Node '${args.nodeName}' of type '${args.nodeType}' added under ${parentPath} in ${args.scenePath}. The scene inherits from another scene, so only the new node was written.`,
+        },
+      ],
+    };
+  }
+
+  private async loadSpriteInInheritedScene(args: any): Promise<any> {
+    const projectRoot = resolvePath(args.projectPath);
+    const sceneFile = join(projectRoot, args.scenePath);
+    const before = readFileSync(sceneFile, 'utf8');
+    const nodeKey = nodeKeyFromPath(String(args.nodePath), sceneRootName(before));
+    if (nodeKey === null) {
+      return this.createErrorResponse(
+        `Node path must start with the root name: ${args.nodePath}`,
+        ['Use read_scene to see the node paths']
+      );
+    }
+    if (!existsSync(join(projectRoot, args.texturePath))) {
+      return this.createErrorResponse(
+        `Texture not found: ${args.texturePath}`,
+        ['Check the path relative to the project directory']
+      );
+    }
+
+    const check = await this.inspectNode(args.projectPath, {
+      scenePath: args.scenePath,
+      nodePath: args.nodePath,
+      checkSprite: true,
+    });
+    if (check.failure) {
+      return this.createErrorResponse(check.failure, ['Check the node path with read_scene']);
+    }
+    if (check.values.IS_SPRITE !== '1') {
+      return this.createErrorResponse(
+        `Node is not a sprite-compatible type: ${args.nodePath}`,
+        ['Use a Sprite2D, Sprite3D or TextureRect node']
+      );
+    }
+
+    const added = addExternalResource(before, 'Texture2D', `res://${args.texturePath}`);
+    writeFileSync(sceneFile, setSceneProperty(added.text, nodeKey, 'texture', `ExtResource("${added.id}")`));
+    const problem = await this.verifyOrRestore(args.projectPath, sceneFile, before, [
+      {
+        params: { scenePath: args.scenePath, nodePath: args.nodePath, property: 'texture', checkHasValue: true },
+        mode: 'hasValue',
+      },
+    ]);
+    if (problem) {
+      return this.createErrorResponse(problem, ['Check the texture file']);
+    }
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Sprite loaded successfully with texture: ${args.texturePath}. The scene inherits from another scene, so only the texture line changed.`,
+        },
+      ],
+    };
+  }
+
+  private async saveInheritedScene(args: any): Promise<any> {
+    const projectRoot = resolvePath(args.projectPath);
+    const sceneFile = join(projectRoot, args.scenePath);
+    if (typeof args.newPath !== 'string' || !args.newPath) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Scene ${args.scenePath} inherits from another scene and has no pending changes to save.`,
+          },
+        ],
+      };
+    }
+    const target = join(projectRoot, args.newPath);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, readFileSync(sceneFile));
+    return {
+      content: [{ type: 'text', text: `Scene saved successfully to: ${args.newPath}` }],
+    };
   }
 
   /**
