@@ -91,6 +91,8 @@ interface GodotProcess {
   droppedErrorLines: number;
   // Script errors found in dropped lines, so trimming does not lose them.
   archivedScriptErrors: { file: string; line: number; message: string }[];
+  // Same for WARNING blocks (GDScript warnings such as shadowed variables).
+  archivedScriptWarnings: { file: string; line: number; message: string }[];
 }
 
 /**
@@ -762,7 +764,7 @@ class GodotServer {
         },
         {
           name: 'get_debug_output',
-          description: 'Get the current debug output and errors. Also returns script errors (file, line, message, count) parsed from Godot output, with repeated errors grouped.',
+          description: 'Get the current debug output and errors. Also returns script errors and script warnings (file, line, message, count) parsed from Godot output, with repeated messages grouped.',
           inputSchema: {
             type: 'object',
             properties: {},
@@ -1273,7 +1275,7 @@ class GodotServer {
     // dropped part would end in the middle of a block, and the block could not be archived.
     let cut = excess;
     for (let i = excess; i < buffer.length; i++) {
-      if (/^\s*(?:SCRIPT )?ERROR: /.test(buffer[i])) {
+      if (/^\s*(?:SCRIPT )?(?:ERROR|WARNING): /.test(buffer[i])) {
         cut = i;
         break;
       }
@@ -1289,6 +1291,11 @@ class GodotServer {
     session.archivedScriptErrors.push(...this.parseScriptErrors(dropped.join('\n')));
     if (session.archivedScriptErrors.length > MAX_ARCHIVED_SCRIPT_ERRORS) {
       session.archivedScriptErrors.splice(0, session.archivedScriptErrors.length - MAX_ARCHIVED_SCRIPT_ERRORS);
+    }
+
+    session.archivedScriptWarnings.push(...this.parseScriptWarnings(dropped.join('\n')));
+    if (session.archivedScriptWarnings.length > MAX_ARCHIVED_SCRIPT_ERRORS) {
+      session.archivedScriptWarnings.splice(0, session.archivedScriptWarnings.length - MAX_ARCHIVED_SCRIPT_ERRORS);
     }
   }
 
@@ -1362,6 +1369,7 @@ class GodotServer {
         droppedOutputLines: 0,
         droppedErrorLines: 0,
         archivedScriptErrors: [],
+        archivedScriptWarnings: [],
       };
 
       process.stdout?.on('data', (data: Buffer) => {
@@ -1463,6 +1471,10 @@ class GodotServer {
       ...this.activeProcess.archivedScriptErrors,
       ...this.parseScriptErrors([...this.activeProcess.output, ...this.activeProcess.errors].join('\n')),
     ]);
+    const scriptWarnings = this.groupScriptErrors([
+      ...this.activeProcess.archivedScriptWarnings,
+      ...this.parseScriptWarnings([...this.activeProcess.output, ...this.activeProcess.errors].join('\n')),
+    ]);
 
     return {
       content: [
@@ -1475,6 +1487,8 @@ class GodotServer {
               droppedOutputLines: this.activeProcess.droppedOutputLines,
               droppedErrorLines: this.activeProcess.droppedErrorLines,
               ...scriptErrors,
+              scriptWarnings: scriptWarnings.scriptErrors,
+              scriptWarningsOmitted: scriptWarnings.scriptErrorsOmitted,
             },
             null,
             2
@@ -1506,6 +1520,10 @@ class GodotServer {
       ...this.activeProcess.archivedScriptErrors,
       ...this.parseScriptErrors([...output, ...errors].join('\n')),
     ]);
+    const scriptWarnings = this.groupScriptErrors([
+      ...this.activeProcess.archivedScriptWarnings,
+      ...this.parseScriptWarnings([...output, ...errors].join('\n')),
+    ]);
     const droppedOutputLines = this.activeProcess.droppedOutputLines;
     const droppedErrorLines = this.activeProcess.droppedErrorLines;
     this.activeProcess = null;
@@ -1522,6 +1540,8 @@ class GodotServer {
               droppedOutputLines,
               droppedErrorLines,
               ...scriptErrors,
+              scriptWarnings: scriptWarnings.scriptErrors,
+              scriptWarningsOmitted: scriptWarnings.scriptErrorsOmitted,
             },
             null,
             2
@@ -1563,6 +1583,21 @@ class GodotServer {
     }
     // Keep the order in which Godot printed the errors.
     return found.sort((a, b) => a.index - b.index).map((f) => f.error);
+  }
+
+  /**
+   * Turn Godot's WARNING output into structured warnings. Warnings from scripts look like:
+   *   WARNING: <message>
+   *   at: GDScript::reload (res://path/file.gd:<line>)
+   * Warnings without a script location (engine warnings) do not match.
+   */
+  private parseScriptWarnings(output: string): { file: string; line: number; message: string }[] {
+    const pattern = /(?<!SCRIPT )WARNING: (.+?)\r?\n\s*at: [^\n]*?\((res:\/\/[^\s:)]+):(\d+)\)/g;
+    const warnings: { file: string; line: number; message: string }[] = [];
+    for (const match of output.matchAll(pattern)) {
+      warnings.push({ message: match[1].trim(), file: match[2], line: Number(match[3]) });
+    }
+    return warnings;
   }
 
   /**
