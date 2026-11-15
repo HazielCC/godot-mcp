@@ -55,6 +55,12 @@ const PROJECT_PATH_PARAMS: Record<string, string[]> = {
   get_uid: ['filePath'],
 };
 
+/** Extensions Godot imports into a .import file and a cached resource (see diagnose_project). */
+const IMPORTABLE_EXTENSIONS = [
+  'png', 'jpg', 'jpeg', 'webp', 'svg', 'bmp', 'tga', 'exr', 'hdr', 'dds',
+  'wav', 'ogg', 'mp3', 'glb', 'gltf', 'fbx', 'ttf', 'otf', 'obj',
+];
+
 interface GodotProcess {
   process: any;
   output: string[];
@@ -1023,6 +1029,24 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'diagnose_project',
+          description: 'Diagnose a Godot project: the Godot executable and version, whether the project is imported, importable assets that have no .import file (which makes load_sprite and other tools fail), and .import files whose outputs are missing. Read-only unless runImport is true.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              runImport: {
+                type: 'boolean',
+                description: 'Import the project first (godot --headless --import). This writes .import files and the import cache. Default false.',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
       ],
     }));
 
@@ -1069,6 +1093,8 @@ class GodotServer {
           return await this.handleCheckProjectScripts(request.params.arguments);
         case 'run_tests':
           return await this.handleRunTests(request.params.arguments);
+        case 'diagnose_project':
+          return await this.handleDiagnoseProject(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -2128,6 +2154,152 @@ class GodotServer {
       args[key] = result.relPath;
     }
     return { args };
+  }
+
+  /**
+   * List files under a directory whose extension is in the given list. Hidden entries
+   * such as .godot/ and .git/ are skipped. Paths are relative to rootDir, with forward slashes.
+   */
+  private listProjectFiles(dir: string, rootDir: string, extensions: string[], found: string[] = []): string[] {
+    if (!existsSync(dir)) {
+      return found;
+    }
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name.startsWith('.')) continue;
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        this.listProjectFiles(fullPath, rootDir, extensions, found);
+      } else if (entry.isFile()) {
+        const extension = entry.name.split('.').pop()?.toLowerCase() ?? '';
+        if (extensions.includes(extension)) {
+          found.push(relative(rootDir, fullPath).replace(/\\/g, '/'));
+        }
+      }
+    }
+    return found;
+  }
+
+  /**
+   * Handle the diagnose_project tool: report what is needed for the project to load its resources.
+   */
+  private async handleDiagnoseProject(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (typeof args.projectPath !== 'string' || !args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    const projectRoot = resolvePath(args.projectPath);
+    const checks: { name: string; status: 'ok' | 'warn' | 'error'; detail: string }[] = [];
+    const add = (name: string, status: 'ok' | 'warn' | 'error', detail: string) => {
+      checks.push({ name, status, detail });
+    };
+
+    // 1. Godot executable and version
+    let godotVersion: string | undefined;
+    try {
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+      }
+      if (!this.godotPath) {
+        add('godot_executable', 'error', 'No Godot executable found. Set GODOT_PATH to its full path.');
+      } else {
+        const { stdout } = await execFileAsync(this.godotPath, ['--version']);
+        godotVersion = stdout.trim();
+        add('godot_executable', 'ok', this.godotPath);
+        const major = Number(/^(\d+)/.exec(godotVersion)?.[1]);
+        add(
+          'godot_version',
+          major === 4 ? 'ok' : 'warn',
+          major === 4 ? godotVersion : `${godotVersion} (this server is written for Godot 4)`
+        );
+      }
+    } catch (error: any) {
+      add('godot_executable', 'error', error?.message || 'Could not run Godot --version');
+    }
+
+    // 2. project.godot
+    const projectFile = join(projectRoot, 'project.godot');
+    if (!existsSync(projectFile)) {
+      add('project_file', 'error', `No project.godot in ${args.projectPath}`);
+    } else {
+      const name = /config\/name="([^"]*)"/.exec(readFileSync(projectFile, 'utf8'))?.[1];
+      add('project_file', 'ok', name ? `Project "${name}"` : 'project.godot found');
+    }
+
+    // 3. Optional import run (writes .import files and the import cache)
+    if (args.runImport === true && godotVersion && this.godotPath) {
+      const importOutput = await this.runGodotImport(projectRoot);
+      add(
+        'import_run',
+        importOutput === undefined ? 'ok' : 'error',
+        importOutput === undefined ? 'Import finished without errors' : importOutput.slice(0, 300)
+      );
+    }
+
+    // 4. Import cache
+    const importedDir = join(projectRoot, '.godot', 'imported');
+    const importedCount = existsSync(importedDir) ? readdirSync(importedDir).length : 0;
+    add(
+      'import_cache',
+      importedCount > 0 ? 'ok' : 'warn',
+      importedCount > 0 ? `${importedCount} entries in .godot/imported` : 'Nothing is imported yet (.godot/imported is empty or missing)'
+    );
+
+    // 5. Importable assets without a .import file
+    const assets = this.listProjectFiles(projectRoot, projectRoot, IMPORTABLE_EXTENSIONS);
+    const missingImport = assets.filter((asset) => !existsSync(join(projectRoot, `${asset}.import`)));
+    add(
+      'import_files',
+      missingImport.length === 0 ? 'ok' : 'warn',
+      missingImport.length === 0
+        ? (assets.length === 0 ? 'No importable assets found' : `${assets.length} importable assets, all with a .import file`)
+        : `${missingImport.length} of ${assets.length} importable assets have no .import file, so Godot cannot load them. Example: ${missingImport[0]}`
+    );
+
+    // 6. .import files whose imported output is missing
+    const importFiles = this.listProjectFiles(projectRoot, projectRoot, ['import']);
+    const brokenImports = importFiles.filter((file) => {
+      const target = /^path="res:\/\/([^"]+)"/m.exec(readFileSync(join(projectRoot, file), 'utf8'))?.[1];
+      return target !== undefined && !existsSync(join(projectRoot, target));
+    });
+    add(
+      'import_outputs',
+      brokenImports.length === 0 ? 'ok' : 'warn',
+      brokenImports.length === 0
+        ? `${importFiles.length} .import files with their outputs present`
+        : `${brokenImports.length} .import files point to missing outputs, so they need re-importing. Example: ${brokenImports[0]}`
+    );
+
+    if ((missingImport.length > 0 || brokenImports.length > 0) && args.runImport !== true) {
+      add('recommendation', 'warn', 'Run diagnose_project with runImport set to true, or run: godot --headless --path <project> --import');
+    }
+
+    const lines = checks.map((c) => `[${c.status}] ${c.name}: ${c.detail}`);
+    const details = {
+      checks,
+      importableAssets: assets.length,
+      missingImport: missingImport.slice(0, 50),
+      brokenImports: brokenImports.slice(0, 50),
+    };
+
+    return {
+      content: [
+        { type: 'text', text: lines.join('\n') },
+        { type: 'text', text: JSON.stringify(details, null, 2) },
+      ],
+      isError: checks.some((c) => c.status === 'error'),
+    };
   }
 
   /**
