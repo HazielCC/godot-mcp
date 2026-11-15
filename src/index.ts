@@ -69,6 +69,13 @@ const PROJECT_PATH_PARAMS: Record<string, string[]> = {
   set_node_property: ['scenePath'],
 };
 
+/**
+ * Tools that load a scene, change it, and save it again. They cannot save a scene that
+ * inherits from another scene: the operations script drops the inherited content (see
+ * scopeProjectPaths).
+ */
+const SCENE_REPACKING_TOOLS = ['add_node', 'load_sprite', 'save_scene', 'set_node_property'];
+
 /** Extensions Godot imports into a .import file and a cached resource (see diagnose_project). */
 const IMPORTABLE_EXTENSIONS = [
   'png', 'jpg', 'jpeg', 'webp', 'svg', 'bmp', 'tga', 'exr', 'hdr', 'dds',
@@ -2219,7 +2226,39 @@ class GodotServer {
       }
       args[key] = result.relPath;
     }
+
+    if (SCENE_REPACKING_TOOLS.includes(toolName) && typeof args.scenePath === 'string') {
+      const sceneFile = join(resolvePath(args.projectPath), args.scenePath);
+      if (this.isInheritedSceneFile(sceneFile)) {
+        return {
+          error: this.createErrorResponse(
+            `Scene ${args.scenePath} inherits from another scene. Saving it with this tool would drop the inherited content.`,
+            [
+              'Make the change in the base scene instead',
+              'Or edit this scene in the Godot editor',
+            ]
+          ),
+        };
+      }
+    }
     return { args };
+  }
+
+  /**
+   * True when a scene inherits from another scene: its root node has no parent and an
+   * instance= attribute. Instanced child nodes are not inheritance and are kept on save.
+   */
+  private isInheritedSceneFile(sceneFile: string): boolean {
+    if (!existsSync(sceneFile)) {
+      return false;
+    }
+    const rootHeader = readFileSync(sceneFile, 'utf8')
+      .split(/\r?\n/)
+      .find((line) => /^\[node\s/.test(line.trim()));
+    if (!rootHeader) {
+      return false;
+    }
+    return /\sinstance=/.test(rootHeader) && !/\sparent=/.test(rootHeader);
   }
 
   /**
