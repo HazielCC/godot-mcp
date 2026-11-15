@@ -26,6 +26,7 @@ const EXPECTED_TOOLS = [
   'update_project_uids',
   'check_script',
   'check_project_scripts',
+  'run_tests',
 ];
 
 const TIMEOUT_MS = 15000;

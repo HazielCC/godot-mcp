@@ -170,6 +170,7 @@ Use this configuration:
 | `update_project_uids` | Updates UID references by resaving resources (Godot 4.4+) |
 | `check_script` | Checks one `.gd` file for syntax errors without running the project, with file and line |
 | `check_project_scripts` | Checks every `.gd` file in a project for syntax errors (one Godot process per file) |
+| `run_tests` | Runs the GUT tests headless and returns totals, each failing test with its message, and script errors. Options: `directory`, `select` (script file name), `testName`, `importFirst`, `timeoutMs` |
 
 ## Building from source
 

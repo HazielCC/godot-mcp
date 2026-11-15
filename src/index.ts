@@ -9,7 +9,8 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize, resolve as resolvePath, relative, isAbsolute } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'fs';
+import { tmpdir } from 'os';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -955,6 +956,40 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'run_tests',
+          description: 'Run the project GUT tests headless and return structured results: totals, each failing test with its message, and script errors. Imports the project first unless importFirst is false. The call waits until the run finishes, which can take minutes on large suites.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              directory: {
+                type: 'string',
+                description: 'Test directory as a res:// path (default res://test). Subdirectories are included.',
+              },
+              select: {
+                type: 'string',
+                description: 'Only run test scripts whose file name contains this text',
+              },
+              testName: {
+                type: 'string',
+                description: 'Only run tests whose name contains this text',
+              },
+              importFirst: {
+                type: 'boolean',
+                description: 'Import the project before running the tests (default true)',
+              },
+              timeoutMs: {
+                type: 'number',
+                description: 'Maximum time to wait for the run, in milliseconds (default 600000, max 3600000)',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
       ],
     }));
 
@@ -994,6 +1029,8 @@ class GodotServer {
           return await this.handleCheckScript(request.params.arguments);
         case 'check_project_scripts':
           return await this.handleCheckProjectScripts(request.params.arguments);
+        case 'run_tests':
+          return await this.handleRunTests(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -1624,6 +1661,294 @@ class GodotServer {
     } catch (error: any) {
       return this.createErrorResponse(
         `Failed to check project scripts: ${error?.message || 'Unknown error'}`,
+        ['Ensure Godot is installed and GODOT_PATH is set correctly']
+      );
+    }
+  }
+
+  /**
+   * Parse the JUnit XML that GUT writes (-gjunit_xml_file). Each test is a <testcase>
+   * with a status attribute (pass, fail or pending). Failing and pending tests carry
+   * their message in a CDATA section. The format is fixed, so a small parser is enough.
+   */
+  private parseJunitXml(xml: string): {
+    tests: { suite: string; name: string; status: string; time: number; message?: string }[];
+  } {
+    const decode = (value: string): string =>
+      value
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&amp;/g, '&');
+
+    const tests: { suite: string; name: string; status: string; time: number; message?: string }[] = [];
+    for (const match of xml.matchAll(/<testcase\s+([^>]*?)>([\s\S]*?)<\/testcase>/g)) {
+      const attributes: Record<string, string> = {};
+      for (const attr of match[1].matchAll(/(\w+)="([^"]*)"/g)) {
+        attributes[attr[1]] = decode(attr[2]);
+      }
+      const cdata = /<!\[CDATA\[([\s\S]*?)\]\]>/.exec(match[2]);
+      tests.push({
+        suite: attributes.classname ?? '',
+        name: attributes.name ?? '',
+        status: attributes.status ?? 'unknown',
+        time: Number(attributes.time) || 0,
+        message: cdata ? cdata[1].trim() : undefined,
+      });
+    }
+    return { tests };
+  }
+
+  /**
+   * Run `godot --headless --import` so resources are imported before the tests run.
+   * Returns the output when Godot exits with an error, or undefined when it succeeds.
+   */
+  private async runGodotImport(projectRoot: string): Promise<string | undefined> {
+    try {
+      await execFileAsync(this.godotPath!, ['--headless', '--path', projectRoot, '--import'], {
+        timeout: 300000,
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      return undefined;
+    } catch (error: any) {
+      if (typeof error?.code !== 'number') {
+        throw error;
+      }
+      return `${error?.stdout ?? ''}\n${error?.stderr ?? ''}`.trim() || `Godot exited with code ${error.code}`;
+    }
+  }
+
+  /**
+   * Run GUT once and write its JUnit XML to a temporary directory outside the project.
+   * The exit code is not enough on its own: GUT can exit with 0 when no tests ran.
+   */
+  private async runGutTests(
+    projectRoot: string,
+    options: { directory: string; select?: string; testName?: string; timeoutMs: number }
+  ): Promise<{ stdout: string; stderr: string; exitCode: number; timedOut: boolean; junitXml?: string }> {
+    const tempDir = mkdtempSync(join(tmpdir(), 'godot-mcp-gut-'));
+    const junitPath = join(tempDir, 'results.xml');
+    try {
+      const gutArgs = [
+        '--headless',
+        '--path',
+        projectRoot,
+        '-s',
+        'addons/gut/gut_cmdln.gd',
+        `-gdir=${options.directory}`,
+        '-ginclude_subdirs',
+        '-gexit',
+        '-gdisable_colors',
+        `-gjunit_xml_file=${junitPath}`,
+      ];
+      if (options.select) {
+        gutArgs.push(`-gselect=${options.select}`);
+      }
+      if (options.testName) {
+        gutArgs.push(`-gunit_test_name=${options.testName}`);
+      }
+
+      let stdout = '';
+      let stderr = '';
+      let exitCode = 0;
+      let timedOut = false;
+      try {
+        const result = await execFileAsync(this.godotPath!, gutArgs, {
+          timeout: options.timeoutMs,
+          maxBuffer: 64 * 1024 * 1024,
+        });
+        stdout = result.stdout ?? '';
+        stderr = result.stderr ?? '';
+      } catch (error: any) {
+        if (error?.killed) {
+          timedOut = true;
+          exitCode = -1;
+        } else if (typeof error?.code === 'number') {
+          exitCode = error.code;
+        } else {
+          throw error;
+        }
+        stdout = error?.stdout ?? '';
+        stderr = error?.stderr ?? '';
+      }
+
+      const junitXml = existsSync(junitPath) ? readFileSync(junitPath, 'utf8') : undefined;
+      return { stdout, stderr, exitCode, timedOut, junitXml };
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * Handle the run_tests tool: run the GUT tests and return structured results.
+   */
+  private async handleRunTests(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (typeof args.projectPath !== 'string' || !args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    for (const key of ['directory', 'select', 'testName']) {
+      if (args[key] !== undefined && typeof args[key] !== 'string') {
+        return this.createErrorResponse(`${key} must be text`, ['Provide it as a string']);
+      }
+    }
+
+    const projectRoot = resolvePath(args.projectPath);
+    if (!existsSync(join(projectRoot, 'project.godot'))) {
+      return this.createErrorResponse(
+        `Not a valid Godot project: ${args.projectPath}`,
+        [
+          'Ensure the path points to a directory containing a project.godot file',
+          'Use list_projects to find valid Godot projects',
+        ]
+      );
+    }
+
+    const directory = String(args.directory ?? 'res://test').replace(/\\/g, '/');
+    if (!directory.startsWith('res://') || directory.includes('..')) {
+      return this.createErrorResponse(
+        `Invalid test directory: ${directory}`,
+        ['Use a res:// path such as res://test']
+      );
+    }
+    const directoryOnDisk = join(projectRoot, directory.slice('res://'.length));
+    if (!existsSync(directoryOnDisk) || !statSync(directoryOnDisk).isDirectory()) {
+      return this.createErrorResponse(
+        `Test directory not found: ${directory}`,
+        ['Check the directory relative to the project root']
+      );
+    }
+
+    const requestedTimeout = typeof args.timeoutMs === 'number' && args.timeoutMs > 0 ? args.timeoutMs : 600000;
+    const timeoutMs = Math.min(requestedTimeout, 3600000);
+
+    try {
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+        if (!this.godotPath) {
+          return this.createErrorResponse(
+            'Could not find a valid Godot executable path',
+            [
+              'Ensure Godot is installed correctly',
+              'Set GODOT_PATH environment variable to specify the correct path',
+            ]
+          );
+        }
+      }
+
+      if (args.importFirst !== false) {
+        const importOutput = await this.runGodotImport(projectRoot);
+        if (importOutput !== undefined) {
+          return this.createErrorResponse(
+            `Godot import failed:\n${importOutput.slice(0, 1500)}`,
+            ['Open the project in the Godot editor to see the import errors', 'Run again with importFirst set to false if the project is already imported']
+          );
+        }
+      }
+
+      this.logDebug(`Running GUT tests in ${directory}`);
+      const run = await this.runGutTests(projectRoot, {
+        directory,
+        select: args.select,
+        testName: args.testName,
+        timeoutMs,
+      });
+
+      if (run.timedOut) {
+        return this.createErrorResponse(
+          `The tests did not finish within ${timeoutMs} ms`,
+          ['Increase timeoutMs, or narrow the run with select or testName']
+        );
+      }
+
+      const output = `${run.stdout}\n${run.stderr}`;
+      const gutError = output.split(/\r?\n/).find((line) => line.includes('[GUT ERROR]'));
+
+      if (!run.junitXml) {
+        return this.createErrorResponse(
+          `GUT did not write results.${gutError ? ` ${gutError.trim()}` : ''}`,
+          [
+            'Check that the test directory contains GUT test scripts (test_*.gd)',
+            'Check the select and testName filters',
+          ]
+        );
+      }
+
+      const parsed = this.parseJunitXml(run.junitXml);
+      if (parsed.tests.length === 0) {
+        return this.createErrorResponse(
+          'No tests were run',
+          ['Check that the test directory contains GUT test scripts (test_*.gd)', 'Check the select and testName filters']
+        );
+      }
+
+      const failures = parsed.tests.filter((t) => t.status === 'fail');
+      const pendingTests = parsed.tests.filter((t) => t.status === 'pending');
+      const passed = parsed.tests.filter((t) => t.status === 'pass').length;
+      const scriptErrors = this.groupScriptErrors(this.parseScriptErrors(output));
+
+      const summary = [
+        `Tests: ${parsed.tests.length} | passed: ${passed} | failed: ${failures.length} | pending: ${pendingTests.length}`,
+      ];
+      if (failures.length > 0) {
+        summary.push('', 'Failures:');
+        for (const failure of failures) {
+          summary.push(`- ${failure.suite}::${failure.name}`);
+          if (failure.message) {
+            summary.push(`    ${failure.message.split(/\r?\n/).slice(0, 3).join('\n    ').slice(0, 300)}`);
+          }
+        }
+      }
+      if (scriptErrors.scriptErrors.length > 0) {
+        summary.push('', 'Script errors:');
+        for (const error of scriptErrors.scriptErrors) {
+          summary.push(`- ${error.file}:${error.line}: ${error.message}${error.count > 1 ? ` (x${error.count})` : ''}`);
+        }
+      }
+      if (gutError) {
+        summary.push('', gutError.trim());
+      }
+
+      const details = {
+        total: parsed.tests.length,
+        passed,
+        failed: failures.length,
+        pending: pendingTests.length,
+        failures: failures.map((f) => ({
+          suite: f.suite,
+          name: f.name,
+          message: f.message?.slice(0, 2000),
+          time: f.time,
+        })),
+        pendingTests: pendingTests.map((p) => ({ suite: p.suite, name: p.name })),
+        scriptErrors: scriptErrors.scriptErrors,
+        scriptErrorsOmitted: scriptErrors.scriptErrorsOmitted,
+        exitCode: run.exitCode,
+      };
+
+      return {
+        content: [
+          { type: 'text', text: summary.join('\n') },
+          { type: 'text', text: JSON.stringify(details, null, 2) },
+        ],
+        isError: run.exitCode !== 0 || failures.length > 0 || scriptErrors.scriptErrors.length > 0,
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to run tests: ${error?.message || 'Unknown error'}`,
         ['Ensure Godot is installed and GODOT_PATH is set correctly']
       );
     }
