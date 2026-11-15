@@ -36,10 +36,21 @@ const __dirname = dirname(__filename);
 /**
  * Interface representing a running Godot process
  */
+/** Maximum lines kept per output stream (stdout and stderr) of a running Godot process. */
+const MAX_BUFFERED_LINES = 2000;
+
+/** Maximum script errors archived from lines that were already dropped from the buffers. */
+const MAX_ARCHIVED_SCRIPT_ERRORS = 500;
+
 interface GodotProcess {
   process: any;
   output: string[];
   errors: string[];
+  // Lines removed from the buffers to keep memory and responses bounded.
+  droppedOutputLines: number;
+  droppedErrorLines: number;
+  // Script errors found in dropped lines, so trimming does not lose them.
+  archivedScriptErrors: { file: string; line: number; message: string }[];
 }
 
 /**
@@ -346,6 +357,15 @@ class GodotServer {
     this.logDebug(`Warning: Could not find Godot in common locations for ${osPlatform}`);
     console.error(`[SERVER] Could not find Godot in common locations for ${osPlatform}`);
     console.error(`[SERVER] Set GODOT_PATH=/path/to/godot environment variable or pass { godotPath: '/path/to/godot' } in the config to specify the correct path.`);
+
+    // An explicit GODOT_PATH that does not work must not be replaced by a guessed default,
+    // because the guess hides the misconfiguration and fails later with an unclear error.
+    if (process.env.GODOT_PATH) {
+      throw new Error(
+        `GODOT_PATH is set to "${process.env.GODOT_PATH}", but that is not a working Godot executable, ` +
+        'and Godot was not found in the common locations. Fix GODOT_PATH or remove it.'
+      );
+    }
 
     if (this.strictPathValidation) {
       // In strict mode, throw an error
@@ -1120,6 +1140,42 @@ class GodotServer {
   }
 
   /**
+   * Append lines to one stream of a running Godot process and keep only the most recent
+   * MAX_BUFFERED_LINES. Script errors in the lines being dropped are archived first.
+   */
+  private appendBufferedLines(session: GodotProcess, stream: 'output' | 'errors', lines: string[]): void {
+    const buffer = session[stream];
+    buffer.push(...lines);
+
+    const excess = buffer.length - MAX_BUFFERED_LINES;
+    if (excess <= 0) {
+      return;
+    }
+
+    // Cut at the start of an error block when one is near the cut point. Otherwise the
+    // dropped part would end in the middle of a block, and the block could not be archived.
+    let cut = excess;
+    for (let i = excess; i < buffer.length; i++) {
+      if (/^\s*(?:SCRIPT )?ERROR: /.test(buffer[i])) {
+        cut = i;
+        break;
+      }
+    }
+
+    const dropped = buffer.splice(0, cut);
+    if (stream === 'output') {
+      session.droppedOutputLines += dropped.length;
+    } else {
+      session.droppedErrorLines += dropped.length;
+    }
+
+    session.archivedScriptErrors.push(...this.parseScriptErrors(dropped.join('\n')));
+    if (session.archivedScriptErrors.length > MAX_ARCHIVED_SCRIPT_ERRORS) {
+      session.archivedScriptErrors.splice(0, session.archivedScriptErrors.length - MAX_ARCHIVED_SCRIPT_ERRORS);
+    }
+  }
+
+  /**
    * Handle the run_project tool
    * @param args Tool arguments
    */
@@ -1154,6 +1210,20 @@ class GodotServer {
         );
       }
 
+      // Make sure a Godot executable is known before spawning it
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+        if (!this.godotPath) {
+          return this.createErrorResponse(
+            'Could not find a valid Godot executable path',
+            [
+              'Ensure Godot is installed correctly',
+              'Set GODOT_PATH environment variable to specify the correct path',
+            ]
+          );
+        }
+      }
+
       // Kill any existing process
       if (this.activeProcess) {
         this.logDebug('Killing existing Godot process before starting a new one');
@@ -1168,12 +1238,18 @@ class GodotServer {
 
       this.logDebug(`Running Godot project: ${args.projectPath}`);
       const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
-      const output: string[] = [];
-      const errors: string[] = [];
+      const session: GodotProcess = {
+        process,
+        output: [],
+        errors: [],
+        droppedOutputLines: 0,
+        droppedErrorLines: 0,
+        archivedScriptErrors: [],
+      };
 
       process.stdout?.on('data', (data: Buffer) => {
         const lines = data.toString().split('\n');
-        output.push(...lines);
+        this.appendBufferedLines(session, 'output', lines);
         lines.forEach((line: string) => {
           if (line.trim()) this.logDebug(`[Godot stdout] ${line}`);
         });
@@ -1181,7 +1257,7 @@ class GodotServer {
 
       process.stderr?.on('data', (data: Buffer) => {
         const lines = data.toString().split('\n');
-        errors.push(...lines);
+        this.appendBufferedLines(session, 'errors', lines);
         lines.forEach((line: string) => {
           if (line.trim()) this.logDebug(`[Godot stderr] ${line}`);
         });
@@ -1201,7 +1277,7 @@ class GodotServer {
         }
       });
 
-      this.activeProcess = { process, output, errors };
+      this.activeProcess = session;
 
       return {
         content: [
@@ -1266,9 +1342,10 @@ class GodotServer {
       );
     }
 
-    const scriptErrors = this.groupScriptErrors(
-      this.parseScriptErrors([...this.activeProcess.output, ...this.activeProcess.errors].join('\n'))
-    );
+    const scriptErrors = this.groupScriptErrors([
+      ...this.activeProcess.archivedScriptErrors,
+      ...this.parseScriptErrors([...this.activeProcess.output, ...this.activeProcess.errors].join('\n')),
+    ]);
 
     return {
       content: [
@@ -1278,6 +1355,8 @@ class GodotServer {
             {
               output: this.activeProcess.output,
               errors: this.activeProcess.errors,
+              droppedOutputLines: this.activeProcess.droppedOutputLines,
+              droppedErrorLines: this.activeProcess.droppedErrorLines,
               ...scriptErrors,
             },
             null,
@@ -1306,9 +1385,12 @@ class GodotServer {
     this.activeProcess.process.kill();
     const output = this.activeProcess.output;
     const errors = this.activeProcess.errors;
-    const scriptErrors = this.groupScriptErrors(
-      this.parseScriptErrors([...output, ...errors].join('\n'))
-    );
+    const scriptErrors = this.groupScriptErrors([
+      ...this.activeProcess.archivedScriptErrors,
+      ...this.parseScriptErrors([...output, ...errors].join('\n')),
+    ]);
+    const droppedOutputLines = this.activeProcess.droppedOutputLines;
+    const droppedErrorLines = this.activeProcess.droppedErrorLines;
     this.activeProcess = null;
 
     return {
@@ -1320,6 +1402,8 @@ class GodotServer {
               message: 'Godot project stopped',
               finalOutput: output,
               finalErrors: errors,
+              droppedOutputLines,
+              droppedErrorLines,
               ...scriptErrors,
             },
             null,
@@ -2923,18 +3007,22 @@ class GodotServer {
   async run() {
     try {
       // Detect Godot path before starting the server
-      await this.detectGodotPath();
-
-      if (!this.godotPath) {
-        console.error('[SERVER] Failed to find a valid Godot executable path');
-        console.error('[SERVER] Please set GODOT_PATH environment variable or provide a valid path');
-        process.exit(1);
+      try {
+        await this.detectGodotPath();
+      } catch (error: unknown) {
+        // Only strict mode stops the server. Otherwise it keeps serving: tools that do not
+        // need Godot still work, and tools that do return this same message as their error.
+        if (this.strictPathValidation) {
+          throw error;
+        }
+        console.error(`[SERVER] ${error instanceof Error ? error.message : 'Unknown error'}`);
       }
 
-      // Check if the path is valid
-      const isValid = await this.isValidGodotPath(this.godotPath);
+      const isValid = this.godotPath ? await this.isValidGodotPath(this.godotPath) : false;
 
-      if (!isValid) {
+      if (!this.godotPath) {
+        console.error('[SERVER] No Godot executable is configured. Tools that run Godot will fail until GODOT_PATH is fixed.');
+      } else if (!isValid) {
         if (this.strictPathValidation) {
           // In strict mode, exit if the path is invalid
           console.error(`[SERVER] Invalid Godot path: ${this.godotPath}`);
@@ -2948,7 +3036,9 @@ class GodotServer {
         }
       }
 
-      console.error(`[SERVER] Using Godot at: ${this.godotPath}`);
+      if (this.godotPath) {
+        console.error(`[SERVER] Using Godot at: ${this.godotPath}`);
+      }
 
       const transport = new StdioServerTransport();
       await this.server.connect(transport);
