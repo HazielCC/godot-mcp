@@ -36,6 +36,9 @@ const __dirname = dirname(__filename);
 /**
  * Interface representing a running Godot process
  */
+/** Properties that are stored inside the node's transform (see setPropertyInInheritedScene). */
+const TRANSFORM_PROPERTIES = ['position', 'rotation', 'rotation_degrees', 'scale', 'skew'];
+
 /** Attributes of a .tscn section header, such as [node name="Player" parent="."]. */
 function parseSceneAttributes(raw: string): Record<string, string> {
   const attributes: Record<string, string> = {};
@@ -120,6 +123,43 @@ function setSceneProperty(text: string, key: string, property: string, literal: 
   }
   lines.splice(section.headerIndex + 1, 0, assignment);
   return lines.join(eol);
+}
+
+/** Escape a string for use inside a regular expression. */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+}
+
+/** True when the section of a node has a line for the property. */
+function sceneSectionHasProperty(text: string, key: string, property: string): boolean {
+  const lines = text.split(/\r?\n/);
+  const section = locateNodeSection(lines, key);
+  if (!section) {
+    return false;
+  }
+  const pattern = new RegExp(`^${escapeRegExp(property)}\\s*=`);
+  for (let i = section.headerIndex + 1; i < section.end; i++) {
+    if (pattern.test(lines[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Remove the lines of the given properties from the section of a node. */
+function removeSceneProperties(text: string, key: string, properties: string[]): string {
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const lines = text.split(/\r?\n/);
+  const section = locateNodeSection(lines, key);
+  if (!section) {
+    return text;
+  }
+  const pattern = new RegExp(`^(${properties.map(escapeRegExp).join('|')})\\s*=`);
+  const kept = lines.filter((line, index) => {
+    const inSection = index > section.headerIndex && index < section.end;
+    return !(inSection && pattern.test(line));
+  });
+  return kept.join(eol);
 }
 
 /** Append a node section that has a name, a type and a parent, and no properties. */
@@ -2955,7 +2995,7 @@ class GodotServer {
     const lines = `${stdout}\n${stderr}`.split(/\r?\n/);
     const values: Record<string, string> = {};
     for (const line of lines) {
-      const match = /^(VALUE|EXPECTED|HAS_VALUE|IS_SPRITE) (.*)$/.exec(line.trim());
+      const match = /^(VALUE|EXPECTED|HAS_VALUE|IS_SPRITE|TRANSFORM) (.*)$/.exec(line.trim());
       if (match) {
         values[match[1]] = match[2];
       }
@@ -3052,17 +3092,36 @@ class GodotServer {
       );
     }
 
+    // position, rotation and scale all live in the transform. When the section overrides the
+    // transform, Godot computes the new transform from the change and that is written instead.
+    const affectsTransform = TRANSFORM_PROPERTIES.includes(args.property);
+    const usesTransform = affectsTransform && sceneSectionHasProperty(before, nodeKey, 'transform');
     const check = await this.inspectNode(args.projectPath, {
       scenePath: args.scenePath,
       nodePath: args.nodePath,
       property: args.property,
       value: args.value,
+      ...(usesTransform ? { applyInMemory: true } : {}),
     });
     if (check.failure) {
       return this.createErrorResponse(check.failure, ['Check the node path and the property name with read_scene']);
     }
 
-    writeFileSync(sceneFile, setSceneProperty(before, nodeKey, args.property, args.value));
+    let updated: string;
+    if (usesTransform) {
+      if (!check.values.TRANSFORM) {
+        return this.createErrorResponse(
+          `Godot did not return the transform for ${args.nodePath}`,
+          ['Check that the node is a Node2D or Node3D']
+        );
+      }
+      const withoutConflicts = removeSceneProperties(before, nodeKey, TRANSFORM_PROPERTIES);
+      updated = setSceneProperty(withoutConflicts, nodeKey, 'transform', check.values.TRANSFORM);
+    } else {
+      updated = setSceneProperty(before, nodeKey, args.property, args.value);
+    }
+    writeFileSync(sceneFile, updated);
+
     const problem = await this.verifyOrRestore(args.projectPath, sceneFile, before, [
       {
         params: { scenePath: args.scenePath, nodePath: args.nodePath, property: args.property, value: args.value },
