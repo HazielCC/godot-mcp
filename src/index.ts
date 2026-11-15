@@ -701,7 +701,7 @@ class GodotServer {
         },
         {
           name: 'get_debug_output',
-          description: 'Get the current debug output and errors',
+          description: 'Get the current debug output and errors. Also returns script errors (file, line, message, count) parsed from Godot output, with repeated errors grouped.',
           inputSchema: {
             type: 'object',
             properties: {},
@@ -1188,6 +1188,34 @@ class GodotServer {
   }
 
   /**
+   * Group repeated script errors (same file, line and message) with a count, and cap
+   * the list. Runtime errors can repeat every frame, so this keeps responses short.
+   */
+  private groupScriptErrors(
+    errors: { file: string; line: number; message: string }[],
+    limit = 50
+  ): {
+    scriptErrors: { file: string; line: number; message: string; count: number }[];
+    scriptErrorsOmitted: number;
+  } {
+    const groups = new Map<string, { file: string; line: number; message: string; count: number }>();
+    for (const error of errors) {
+      const key = `${error.file}:${error.line}:${error.message}`;
+      const existing = groups.get(key);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        groups.set(key, { ...error, count: 1 });
+      }
+    }
+    const all = [...groups.values()];
+    return {
+      scriptErrors: all.slice(0, limit),
+      scriptErrorsOmitted: Math.max(0, all.length - limit),
+    };
+  }
+
+  /**
    * Handle the get_debug_output tool
    */
   private async handleGetDebugOutput() {
@@ -1201,6 +1229,10 @@ class GodotServer {
       );
     }
 
+    const scriptErrors = this.groupScriptErrors(
+      this.parseScriptErrors([...this.activeProcess.output, ...this.activeProcess.errors].join('\n'))
+    );
+
     return {
       content: [
         {
@@ -1209,6 +1241,7 @@ class GodotServer {
             {
               output: this.activeProcess.output,
               errors: this.activeProcess.errors,
+              ...scriptErrors,
             },
             null,
             2
@@ -1236,6 +1269,9 @@ class GodotServer {
     this.activeProcess.process.kill();
     const output = this.activeProcess.output;
     const errors = this.activeProcess.errors;
+    const scriptErrors = this.groupScriptErrors(
+      this.parseScriptErrors([...output, ...errors].join('\n'))
+    );
     this.activeProcess = null;
 
     return {
@@ -1247,6 +1283,7 @@ class GodotServer {
               message: 'Godot project stopped',
               finalOutput: output,
               finalErrors: errors,
+              ...scriptErrors,
             },
             null,
             2
@@ -1260,13 +1297,16 @@ class GodotServer {
    * Handle the get_godot_version tool
    */
   /**
-   * Turn Godot's --check-only output into structured errors.
-   * Parse and compile errors look like:
-   *   SCRIPT ERROR: Parse Error: <message>
-   *      at: GDScript::reload (res://path/file.gd:<line>)
+   * Turn Godot's script error output into structured errors. Covers both:
+   * - compile-time errors from --check-only:
+   *     SCRIPT ERROR: Parse Error: <message>
+   *        at: GDScript::reload (res://path/file.gd:<line>)
+   * - runtime errors while the game runs:
+   *     SCRIPT ERROR: <message>
+   *        at: _ready (res://path/file.gd:<line>)
    */
   private parseScriptErrors(output: string): { file: string; line: number; message: string }[] {
-    const pattern = /SCRIPT ERROR: (?:Parse|Compile) Error: (.+?)\r?\n\s*at: [^\n]*?\((res:\/\/[^\s:)]+):(\d+)\)/g;
+    const pattern = /SCRIPT ERROR: (?:(?:Parse|Compile) Error: )?(.+?)\r?\n\s*at: [^\n]*?\((res:\/\/[^\s:)]+):(\d+)\)/g;
     const errors: { file: string; line: number; message: string }[] = [];
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(output)) !== null) {

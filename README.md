@@ -157,7 +157,7 @@ Use this configuration:
 | `launch_editor` | Opens the Godot editor for a project |
 | `run_project` | Runs a project in debug mode |
 | `stop_project` | Stops the running project |
-| `get_debug_output` | Returns the console output and errors |
+| `get_debug_output` | Returns the console output and errors, plus script errors with file, line, and message (repeated errors are grouped with a count) |
 | `get_godot_version` | Returns the installed Godot version |
 | `list_projects` | Finds Godot projects in a folder |
 | `get_project_info` | Describes a project's structure |
