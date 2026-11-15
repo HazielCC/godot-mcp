@@ -1294,25 +1294,37 @@ class GodotServer {
   }
 
   /**
-   * Handle the get_godot_version tool
-   */
-  /**
-   * Turn Godot's script error output into structured errors. Covers both:
+   * Turn Godot's script error output into structured errors. Covers three forms:
    * - compile-time errors from --check-only:
    *     SCRIPT ERROR: Parse Error: <message>
    *        at: GDScript::reload (res://path/file.gd:<line>)
    * - runtime errors while the game runs:
    *     SCRIPT ERROR: <message>
    *        at: _ready (res://path/file.gd:<line>)
+   * - push_error() calls, where the location is the first backtrace frame:
+   *     ERROR: <message>
+   *        at: push_error (core/...)
+   *        GDScript backtrace (most recent call first):
+   *            [0] _process (res://path/file.gd:<line>)
    */
   private parseScriptErrors(output: string): { file: string; line: number; message: string }[] {
-    const pattern = /SCRIPT ERROR: (?:(?:Parse|Compile) Error: )?(.+?)\r?\n\s*at: [^\n]*?\((res:\/\/[^\s:)]+):(\d+)\)/g;
-    const errors: { file: string; line: number; message: string }[] = [];
-    let match: RegExpExecArray | null;
-    while ((match = pattern.exec(output)) !== null) {
-      errors.push({ message: match[1].trim(), file: match[2], line: Number(match[3]) });
+    // SCRIPT ERROR blocks: the location is on the "at:" line.
+    const scriptPattern = /SCRIPT ERROR: (?:(?:Parse|Compile) Error: )?(.+?)\r?\n\s*at: [^\n]*?\((res:\/\/[^\s:)]+):(\d+)\)/g;
+    // push_error() blocks: not prefixed by SCRIPT, and the location is on the first backtrace frame.
+    // Engine errors without a script frame do not match, so they are not reported as script errors.
+    const pushPattern = /(?<!SCRIPT )ERROR: (.+?)\r?\n\s*at: [^\n]*\r?\n\s*GDScript backtrace[^\n]*\r?\n\s*\[0\] [^\n]*?\((res:\/\/[^\s:)]+):(\d+)\)/g;
+
+    const found: { index: number; error: { file: string; line: number; message: string } }[] = [];
+    for (const pattern of [scriptPattern, pushPattern]) {
+      for (const match of output.matchAll(pattern)) {
+        found.push({
+          index: match.index ?? 0,
+          error: { message: match[1].trim(), file: match[2], line: Number(match[3]) },
+        });
+      }
     }
-    return errors;
+    // Keep the order in which Godot printed the errors.
+    return found.sort((a, b) => a.index - b.index).map((f) => f.error);
   }
 
   /**
@@ -1617,6 +1629,9 @@ class GodotServer {
     }
   }
 
+  /**
+   * Handle the get_godot_version tool
+   */
   private async handleGetGodotVersion() {
     try {
       // Ensure godotPath is set
