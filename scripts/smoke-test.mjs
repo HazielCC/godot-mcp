@@ -30,6 +30,9 @@ const EXPECTED_TOOLS = [
   'diagnose_project',
   'read_scene',
   'set_node_property',
+  'install_editor_bridge',
+  'editor_status',
+  'editor_command',
 ];
 
 const TIMEOUT_MS = 15000;

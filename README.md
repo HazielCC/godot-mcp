@@ -174,6 +174,9 @@ Use this configuration:
 | `diagnose_project` | Checks the Godot executable and version, the project file, the import cache, importable assets without a `.import` file, and `.import` files with missing outputs. Option: `runImport` |
 | `read_scene` | Reads a `.tscn` scene as a node tree, with each node's type, path (such as `root/Player`), and properties |
 | `set_node_property` | Sets one property on a node of an existing scene and saves it. The value is a Godot literal, such as `Vector2(1, 2)` |
+| `install_editor_bridge` | Installs the Godot MCP Bridge plugin in a project and enables it, so the server can drive the project while the editor has it open |
+| `editor_status` | Checks whether the project is open in the editor with the bridge enabled, and reports the open scene and whether it is playing |
+| `editor_command` | Runs one command in the open editor: scene tree, open or save a scene, get or set a property (with undo), add a node, undo, redo, play, stop |
 
 ## Building from source
 

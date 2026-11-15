@@ -26,7 +26,13 @@ try {
     path.join(__dirname, '..', 'build', 'scripts', 'check_scripts.gd')
   );
 
-  console.log('Successfully copied godot_operations.gd and check_scripts.gd to build/scripts');
+  // Copy the editor bridge plugin (addons/godot_mcp_bridge), installed into projects on request
+  fs.copySync(
+    path.join(__dirname, '..', 'src', 'addons', 'godot_mcp_bridge'),
+    path.join(__dirname, '..', 'build', 'addons', 'godot_mcp_bridge')
+  );
+
+  console.log('Successfully copied godot_operations.gd, check_scripts.gd and the editor bridge to build');
 } catch (error) {
   console.error('Error copying scripts:', error);
   process.exit(1);

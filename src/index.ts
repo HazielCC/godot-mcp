@@ -9,7 +9,8 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize, resolve as resolvePath, relative, isAbsolute } from 'path';
-import { existsSync, readdirSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, cpSync } from 'fs';
+import net from 'net';
 import { tmpdir } from 'os';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
@@ -36,6 +37,12 @@ const __dirname = dirname(__filename);
 /**
  * Interface representing a running Godot process
  */
+/** Commands the editor bridge accepts (see src/addons/godot_mcp_bridge/plugin.gd). */
+const EDITOR_BRIDGE_COMMANDS = [
+  'status', 'scene_tree', 'open_scene', 'save_scene', 'get_property', 'set_property',
+  'add_node', 'undo', 'redo', 'play', 'stop', 'refresh_filesystem',
+];
+
 /** Properties that are stored inside the node's transform (see setPropertyInInheritedScene). */
 const TRANSFORM_PROPERTIES = ['position', 'rotation', 'rotation_degrees', 'scale', 'skew'];
 
@@ -1294,6 +1301,57 @@ class GodotServer {
             required: ['projectPath', 'scenePath', 'nodePath', 'property', 'value'],
           },
         },
+        {
+          name: 'install_editor_bridge',
+          description: 'Install the Godot MCP Bridge editor plugin into a project: copies addons/godot_mcp_bridge and enables it in project.godot. Lets the server drive the project while it is open in the Godot editor. Changes the project: run it only when the user asks. Open the project in the editor afterwards so the plugin loads.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'editor_status',
+          description: 'Check whether the project is open in the Godot editor with the Godot MCP Bridge enabled, and report the editor version, the open scene and whether a scene is playing.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'editor_command',
+          description: 'Run one command in the open Godot editor through the Godot MCP Bridge. Commands: status, scene_tree, open_scene (path), save_scene, get_property (node_path, property), set_property (node_path, property, value as a Godot literal), add_node (parent_path, type, name), undo, redo, play (mode: main, current or custom with path), stop, refresh_filesystem. Changes made this way go through the editor undo history. Node paths start with the scene root name, such as "root/Player".',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              command: {
+                type: 'string',
+                enum: EDITOR_BRIDGE_COMMANDS,
+                description: 'The editor command to run',
+              },
+              arguments: {
+                type: 'object',
+                description: 'Arguments of the command, as described above',
+              },
+            },
+            required: ['projectPath', 'command'],
+          },
+        },
       ],
     }));
 
@@ -1342,6 +1400,12 @@ class GodotServer {
           return await this.handleRunTests(request.params.arguments);
         case 'diagnose_project':
           return await this.handleDiagnoseProject(request.params.arguments);
+        case 'install_editor_bridge':
+          return await this.handleInstallEditorBridge(request.params.arguments);
+        case 'editor_status':
+          return await this.handleEditorStatus(request.params.arguments);
+        case 'editor_command':
+          return await this.handleEditorCommand(request.params.arguments);
         case 'read_scene':
           return await this.handleReadScene(request.params.arguments);
         case 'set_node_property':
@@ -3289,6 +3353,234 @@ class GodotServer {
     writeFileSync(target, readFileSync(sceneFile));
     return {
       content: [{ type: 'text', text: `Scene saved successfully to: ${args.newPath}` }],
+    };
+  }
+
+  /** Folder with the editor bridge plugin shipped in this server build. */
+  private editorBridgeSource(): string {
+    return join(__dirname, 'addons', 'godot_mcp_bridge');
+  }
+
+  /**
+   * Add the bridge plugin to the enabled list in [editor_plugins] of project.godot.
+   * Returns the text unchanged when the plugin is already listed.
+   */
+  private enableEditorPlugin(projectText: string, pluginCfg: string): string {
+    const eol = projectText.includes('\r\n') ? '\r\n' : '\n';
+    const quoted = `"${pluginCfg}"`;
+    const lines = projectText.split(/\r?\n/);
+    const section = lines.findIndex((line) => line.trim() === '[editor_plugins]');
+    if (section === -1) {
+      const trimmed = projectText.replace(/\s*$/, '');
+      return `${trimmed}${eol}${eol}[editor_plugins]${eol}${eol}enabled=PackedStringArray(${quoted})${eol}`;
+    }
+
+    let end = lines.length;
+    for (let i = section + 1; i < lines.length; i++) {
+      if (lines[i].trim().startsWith('[')) {
+        end = i;
+        break;
+      }
+    }
+    let enabled = -1;
+    for (let i = section + 1; i < end; i++) {
+      if (lines[i].startsWith('enabled=')) {
+        enabled = i;
+        break;
+      }
+    }
+    if (enabled === -1) {
+      lines.splice(section + 1, 0, `enabled=PackedStringArray(${quoted})`);
+      return lines.join(eol);
+    }
+
+    const match = /^enabled=PackedStringArray\((.*)\)\s*$/.exec(lines[enabled]);
+    if (!match) {
+      throw new Error('project.godot has an enabled= line this tool does not understand. Enable the plugin in the editor instead.');
+    }
+    if (match[1].includes(pluginCfg)) {
+      return projectText;
+    }
+    const items = match[1].trim();
+    lines[enabled] = `enabled=PackedStringArray(${items === '' ? quoted : `${items}, ${quoted}`})`;
+    return lines.join(eol);
+  }
+
+  /** Connection details the editor writes to .godot/mcp_bridge.json while the plugin runs. */
+  private readEditorBridgeInfo(projectRoot: string): { port: number; token: string } | undefined {
+    const infoPath = join(projectRoot, '.godot', 'mcp_bridge.json');
+    if (!existsSync(infoPath)) {
+      return undefined;
+    }
+    try {
+      const info = JSON.parse(readFileSync(infoPath, 'utf8'));
+      if (typeof info.port === 'number' && typeof info.token === 'string') {
+        return { port: info.port, token: info.token };
+      }
+    } catch {
+      // A damaged file is treated as no bridge.
+    }
+    return undefined;
+  }
+
+  /** Send one request to the editor bridge and wait for its one-line answer. */
+  private sendEditorRequest(
+    info: { port: number; token: string },
+    command: string,
+    args: Record<string, unknown>
+  ): Promise<{ ok: boolean; result?: any; error?: string }> {
+    return new Promise((resolve) => {
+      const socket = net.createConnection({ host: '127.0.0.1', port: info.port });
+      let data = '';
+      let settled = false;
+      const finish = (value: { ok: boolean; result?: any; error?: string }) => {
+        if (!settled) {
+          settled = true;
+          socket.destroy();
+          resolve(value);
+        }
+      };
+      socket.setTimeout(15000, () => finish({ ok: false, error: 'The editor did not answer within 15 seconds' }));
+      socket.on('connect', () => {
+        socket.write(JSON.stringify({ id: 1, token: info.token, command, arguments: args }) + '\n');
+      });
+      socket.on('data', (chunk: Buffer) => {
+        data += chunk.toString('utf8');
+        const newline = data.indexOf('\n');
+        if (newline !== -1) {
+          try {
+            finish(JSON.parse(data.slice(0, newline)));
+          } catch {
+            finish({ ok: false, error: 'The editor bridge sent an answer that is not valid JSON' });
+          }
+        }
+      });
+      socket.on('error', (error: Error) => finish({ ok: false, error: `Could not reach the editor bridge: ${error.message}` }));
+      socket.on('close', () => finish({ ok: false, error: 'The editor closed the connection without answering' }));
+    });
+  }
+
+  /**
+   * Handle the install_editor_bridge tool: copy the bridge plugin into the project and enable it.
+   */
+  private async handleInstallEditorBridge(args: any) {
+    if (typeof args?.projectPath !== 'string' || !args.projectPath) {
+      return this.createErrorResponse('Project path is required', ['Provide a valid path to a Godot project directory']);
+    }
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse('Invalid project path', ['Provide a valid path without ".." or other potentially unsafe characters']);
+    }
+
+    const projectRoot = resolvePath(args.projectPath);
+    const projectFile = join(projectRoot, 'project.godot');
+    if (!existsSync(projectFile)) {
+      return this.createErrorResponse(
+        `Not a valid Godot project: ${args.projectPath}`,
+        ['Ensure the path points to a directory containing a project.godot file']
+      );
+    }
+    const source = this.editorBridgeSource();
+    if (!existsSync(join(source, 'plugin.cfg'))) {
+      return this.createErrorResponse('The editor bridge files are missing from this server build', ['Rebuild the server (npm run build)']);
+    }
+
+    try {
+      // Compute the project change first, so a file this tool cannot edit leaves no partial install.
+      const original = readFileSync(projectFile, 'utf8');
+      const updated = this.enableEditorPlugin(original, 'res://addons/godot_mcp_bridge/plugin.cfg');
+      cpSync(source, join(projectRoot, 'addons', 'godot_mcp_bridge'), { recursive: true });
+      if (updated !== original) {
+        writeFileSync(projectFile, updated);
+      }
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Installed the Godot MCP Bridge in ${args.projectPath} and enabled it in project.godot. Open the project in the Godot editor (or reload it) so the plugin starts, then editor_status should report it connected.`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Could not install the bridge: ${error?.message || 'Unknown error'}`,
+        ['Check that the project folder is writable']
+      );
+    }
+  }
+
+  /**
+   * Handle the editor_status tool: is the project open in the editor with the bridge enabled?
+   */
+  private async handleEditorStatus(args: any) {
+    if (typeof args?.projectPath !== 'string' || !args.projectPath) {
+      return this.createErrorResponse('Project path is required', ['Provide a valid path to a Godot project directory']);
+    }
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse('Invalid project path', ['Provide a valid path without ".." or other potentially unsafe characters']);
+    }
+
+    const info = this.readEditorBridgeInfo(resolvePath(args.projectPath));
+    if (!info) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              connected: false,
+              reason: 'No bridge information in .godot/mcp_bridge.json. Install the bridge with install_editor_bridge and open the project in the Godot editor.',
+            }, null, 2),
+          },
+        ],
+      };
+    }
+
+    const response = await this.sendEditorRequest(info, 'status', {});
+    if (!response.ok) {
+      return this.createErrorResponse(
+        `Not connected: ${response.error ?? 'unknown error'}`,
+        ['The editor may have closed; its bridge file can be left over from an earlier session', 'Open the project in the Godot editor']
+      );
+    }
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ connected: true, ...response.result }, null, 2) }],
+    };
+  }
+
+  /**
+   * Handle the editor_command tool: run one allowed command in the open editor.
+   */
+  private async handleEditorCommand(args: any) {
+    if (typeof args?.projectPath !== 'string' || !args.projectPath) {
+      return this.createErrorResponse('Project path is required', ['Provide a valid path to a Godot project directory']);
+    }
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse('Invalid project path', ['Provide a valid path without ".." or other potentially unsafe characters']);
+    }
+    if (typeof args.command !== 'string' || !EDITOR_BRIDGE_COMMANDS.includes(args.command)) {
+      return this.createErrorResponse(
+        `Unknown editor command: ${String(args.command)}`,
+        [`Use one of: ${EDITOR_BRIDGE_COMMANDS.join(', ')}`]
+      );
+    }
+    const commandArgs: unknown = args.arguments ?? {};
+    if (typeof commandArgs !== 'object' || commandArgs === null || Array.isArray(commandArgs)) {
+      return this.createErrorResponse('arguments must be an object', ['Pass the command arguments as an object']);
+    }
+
+    const info = this.readEditorBridgeInfo(resolvePath(args.projectPath));
+    if (!info) {
+      return this.createErrorResponse(
+        'The Godot editor bridge is not running for this project',
+        ['Install it with install_editor_bridge and open the project in the Godot editor']
+      );
+    }
+
+    const response = await this.sendEditorRequest(info, args.command, commandArgs as Record<string, unknown>);
+    if (!response.ok) {
+      return this.createErrorResponse(response.error ?? 'The editor refused the command', ['Check the arguments with editor_status']);
+    }
+    return {
+      content: [{ type: 'text', text: JSON.stringify(response.result ?? {}, null, 2) }],
     };
   }
 
