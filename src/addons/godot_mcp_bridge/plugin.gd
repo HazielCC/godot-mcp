@@ -23,6 +23,7 @@ var _buffers: Dictionary = {}
 var _token: String = ""
 var _port: int = 0
 var _tree_count: int = 0
+var _handling: bool = false
 
 func _enter_tree() -> void:
     var crypto: Crypto = Crypto.new()
@@ -53,6 +54,15 @@ func _exit_tree() -> void:
     _remove_info()
 
 func _process(_delta: float) -> void:
+    # Saving and playing run the editor's main loop again, which calls this function from
+    # inside a request. Serving clients then would handle the same request again, so skip it.
+    if _handling:
+        return
+    _handling = true
+    _serve_clients()
+    _handling = false
+
+func _serve_clients() -> void:
     if _server == null or not _server.is_listening():
         return
 
@@ -82,11 +92,11 @@ func _process(_delta: float) -> void:
         while newline != -1:
             var line: String = buffered.substr(0, newline).strip_edges()
             buffered = buffered.substr(newline + 1)
+            _buffers[client] = buffered
             if line != "":
                 var answer: Dictionary = _handle_line(line)
                 client.put_data((JSON.stringify(answer) + "\n").to_utf8_buffer())
             newline = buffered.find("\n")
-        _buffers[client] = buffered
 
 func _forget(client: StreamPeerTCP) -> void:
     _clients.erase(client)
