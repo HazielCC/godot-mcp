@@ -1286,6 +1286,8 @@ class GodotServer {
     ok: boolean;
     errors: { file: string; line: number; message: string }[];
     rawOutput: string;
+    // Set when Godot could not be started at all (for example, a wrong GODOT_PATH).
+    executionError?: string;
   }> {
     let output = '';
     let exitCode = 0;
@@ -1300,9 +1302,18 @@ class GodotServer {
       ]);
       output = `${stdout ?? ''}\n${stderr ?? ''}`;
     } catch (error: any) {
-      exitCode = typeof error?.code === 'number' ? error.code : 1;
-      const combined = `${error?.stdout ?? ''}\n${error?.stderr ?? ''}`;
-      output = combined.trim() ? combined : (error?.message ?? '');
+      // A numeric code is Godot's exit status. A string code (such as ENOENT) means
+      // the executable could not be started, so there is no script result to report.
+      if (typeof error?.code !== 'number') {
+        return {
+          ok: false,
+          errors: [],
+          rawOutput: '',
+          executionError: error?.message || 'Unknown error starting Godot',
+        };
+      }
+      exitCode = error.code;
+      output = `${error?.stdout ?? ''}\n${error?.stderr ?? ''}`;
     }
 
     const errors = this.parseScriptErrors(output);
@@ -1313,15 +1324,24 @@ class GodotServer {
     };
   }
 
-  private formatScriptErrors(
-    errors: { file: string; line: number; message: string }[],
-    rawOutput: string
+  /**
+   * Describe a failed check. Use the parsed errors when there are any; otherwise
+   * show Godot's raw output so the failure is not hidden, under an accurate heading.
+   */
+  private formatCheckFailure(
+    label: string,
+    result: { errors: { file: string; line: number; message: string }[]; rawOutput: string }
   ): string {
-    if (errors.length === 0) {
-      // Godot failed without a parseable error: show what it printed instead of hiding it.
-      return `Godot reported a failure without a recognized error:\n${rawOutput.slice(0, 1500)}`;
+    if (result.errors.length > 0) {
+      const lines = result.errors.map((e) => `${e.file}:${e.line}: ${e.message}`).join('\n');
+      return `Parse errors in ${label}:\n${lines}`;
     }
-    return errors.map((e) => `${e.file}:${e.line}: ${e.message}`).join('\n');
+    // Drop Godot's version banner and blank lines so the useful lines come first.
+    const useful = result.rawOutput
+      .split(/\r?\n/)
+      .filter((line) => line.trim() !== '' && !line.startsWith('Godot Engine v'))
+      .join('\n');
+    return `Godot could not check ${label}:\n${useful ? useful.slice(0, 1500) : '(Godot printed no output)'}`;
   }
 
   /**
@@ -1351,6 +1371,14 @@ class GodotServer {
       return this.createErrorResponse(
         'Project path and script path are required',
         ['Provide projectPath and scriptPath (relative to the project, ending in .gd)']
+      );
+    }
+
+    // validatePath expects strings; a number or object here would throw an internal error.
+    if (typeof args.projectPath !== 'string' || typeof args.scriptPath !== 'string') {
+      return this.createErrorResponse(
+        'Project path and script path must be text',
+        ['Provide projectPath and scriptPath as strings']
       );
     }
 
@@ -1412,6 +1440,16 @@ class GodotServer {
 
       this.logDebug(`Checking script: ${relativeScript}`);
       const result = await this.runCheckOnly(projectRoot, `res://${relativeScript}`);
+      if (result.executionError) {
+        return this.createErrorResponse(
+          `Failed to run Godot: ${result.executionError}`,
+          [
+            'Set GODOT_PATH to the full path of a Godot executable',
+            'Check that Godot runs from a terminal with --version',
+          ]
+        );
+      }
+
       if (result.ok) {
         return {
           content: [{ type: 'text', text: `OK: ${relativeScript} has no parse errors.` }],
@@ -1422,7 +1460,7 @@ class GodotServer {
         content: [
           {
             type: 'text',
-            text: `Parse errors in ${relativeScript}:\n${this.formatScriptErrors(result.errors, result.rawOutput)}`,
+            text: this.formatCheckFailure(relativeScript, result),
           },
         ],
         isError: true,
@@ -1440,6 +1478,14 @@ class GodotServer {
    */
   private async handleCheckProjectScripts(args: any) {
     args = this.normalizeParameters(args);
+
+    // validatePath expects a string; reject other types before it runs.
+    if (args.projectPath !== undefined && typeof args.projectPath !== 'string') {
+      return this.createErrorResponse(
+        'Project path must be text',
+        ['Provide projectPath as a string']
+      );
+    }
 
     if (!args.projectPath) {
       return this.createErrorResponse(
@@ -1490,6 +1536,16 @@ class GodotServer {
       const failures: { script: string; errors: { file: string; line: number; message: string }[]; rawOutput: string }[] = [];
       for (const script of scripts) {
         const result = await this.runCheckOnly(projectRoot, `res://${script}`);
+        if (result.executionError) {
+          // Godot did not start, so every remaining file would fail the same way.
+          return this.createErrorResponse(
+            `Failed to run Godot: ${result.executionError}`,
+            [
+              'Set GODOT_PATH to the full path of a Godot executable',
+              'Check that Godot runs from a terminal with --version',
+            ]
+          );
+        }
         if (!result.ok) {
           failures.push({ script, errors: result.errors, rawOutput: result.rawOutput });
         }
@@ -1502,7 +1558,7 @@ class GodotServer {
       }
 
       const details = failures
-        .map((f) => `${f.script}\n${this.formatScriptErrors(f.errors, f.rawOutput)}`)
+        .map((f) => this.formatCheckFailure(f.script, f))
         .join('\n\n');
       return {
         content: [
