@@ -9,7 +9,7 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize, resolve as resolvePath, relative, isAbsolute } from 'path';
-import { existsSync, readdirSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
@@ -41,6 +41,19 @@ const MAX_BUFFERED_LINES = 2000;
 
 /** Maximum script errors archived from lines that were already dropped from the buffers. */
 const MAX_ARCHIVED_SCRIPT_ERRORS = 500;
+
+/**
+ * Parameters of each tool that are file paths inside the project. Every one of them is
+ * checked before the tool runs, so no tool can read or write outside the project folder.
+ */
+const PROJECT_PATH_PARAMS: Record<string, string[]> = {
+  create_scene: ['scenePath'],
+  add_node: ['scenePath'],
+  load_sprite: ['scenePath', 'texturePath'],
+  save_scene: ['scenePath', 'newPath'],
+  export_mesh_library: ['scenePath', 'outputPath'],
+  get_uid: ['filePath'],
+};
 
 interface GodotProcess {
   process: any;
@@ -1016,6 +1029,11 @@ class GodotServer {
     // Handle tool calls
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       this.logDebug(`Handling tool request: ${request.params.name}`);
+      const scoped = this.scopeProjectPaths(request.params.name, request.params.arguments);
+      if ('error' in scoped) {
+        return scoped.error;
+      }
+      request.params.arguments = scoped.args;
       switch (request.params.name) {
         case 'launch_editor':
           return await this.handleLaunchEditor(request.params.arguments);
@@ -2036,6 +2054,80 @@ class GodotServer {
         ['Ensure Godot is installed and GODOT_PATH is set correctly']
       );
     }
+  }
+
+  /**
+   * Check that a path used for reading or writing stays inside the project folder.
+   * Accepts a project-relative path, optionally prefixed with res://. Rejects absolute
+   * paths, drive letters, paths that climb out with "..", and links inside the project
+   * that lead outside it. Returns the normalized path relative to the project.
+   */
+  private resolveInsideProject(projectPath: string, value: unknown): { relPath: string } | { error: string } {
+    if (typeof value !== 'string' || value.trim() === '') {
+      return { error: 'A path relative to the project is required' };
+    }
+
+    const projectRoot = resolvePath(projectPath);
+    if (!existsSync(projectRoot)) {
+      return { error: `Project directory does not exist: ${projectPath}` };
+    }
+
+    const cleaned = value.replace(/\\/g, '/').replace(/^res:\/\//, '');
+    if (cleaned.startsWith('/') || /^[A-Za-z]:/.test(cleaned) || isAbsolute(cleaned)) {
+      return { error: `Path must be relative to the project, not absolute: ${value}` };
+    }
+
+    const target = resolvePath(projectRoot, cleaned);
+    const rel = relative(projectRoot, target).replace(/\\/g, '/');
+    if (rel === '' || rel === '..' || rel.startsWith('../')) {
+      return { error: `Path is outside the project: ${value}` };
+    }
+
+    // A link inside the project must not lead outside it either. Check the nearest
+    // existing ancestor, because the target itself may not exist yet.
+    let existing = target;
+    while (!existsSync(existing) && dirname(existing) !== existing) {
+      existing = dirname(existing);
+    }
+    const realRel = relative(realpathSync(projectRoot), realpathSync(existing)).replace(/\\/g, '/');
+    if (realRel === '..' || realRel.startsWith('../') || isAbsolute(realRel)) {
+      return { error: `Path leads outside the project through a link: ${value}` };
+    }
+
+    return { relPath: rel };
+  }
+
+  /**
+   * Apply resolveInsideProject to every path parameter of a tool (see PROJECT_PATH_PARAMS).
+   * Tools without path parameters, and invalid projectPath values, pass through unchanged so
+   * the handler reports its own error.
+   */
+  private scopeProjectPaths(toolName: string, rawArgs: any): { args: any } | { error: any } {
+    const pathParams = PROJECT_PATH_PARAMS[toolName];
+    if (!pathParams) {
+      return { args: rawArgs };
+    }
+
+    const args = this.normalizeParameters(rawArgs ?? {});
+    if (typeof args.projectPath !== 'string' || !args.projectPath || !this.validatePath(args.projectPath)) {
+      return { args };
+    }
+
+    for (const key of pathParams) {
+      if (args[key] === undefined || args[key] === null || args[key] === '') {
+        continue;
+      }
+      const result = this.resolveInsideProject(args.projectPath, args[key]);
+      if ('error' in result) {
+        return {
+          error: this.createErrorResponse(result.error, [
+            'Use a path relative to the project directory, for example scenes/main.tscn',
+          ]),
+        };
+      }
+      args[key] = result.relPath;
+    }
+    return { args };
   }
 
   /**
