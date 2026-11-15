@@ -24,6 +24,8 @@ const EXPECTED_TOOLS = [
   'save_scene',
   'get_uid',
   'update_project_uids',
+  'check_script',
+  'check_project_scripts',
 ];
 
 const TIMEOUT_MS = 15000;
