@@ -812,14 +812,8 @@ func export_mesh_library(params: Dictionary) -> void:
             if debug_mode and not collision_added:
                 print("No collision shape found for mesh: " + child.name)
 
-            # Add preview if available
-            if mesh_instance.mesh:
-                # Passed as Variant to keep the original runtime behavior. Godot expects a
-                # Texture2D here, so the preview is not set; see the PR notes.
-                var preview: Variant = mesh_instance.mesh
-                mesh_library.set_item_preview(item_id, preview)
-                if debug_mode:
-                    print("Added preview for mesh: " + child.name)
+            # No preview is set: MeshLibrary.set_item_preview expects a Texture2D, and the
+            # editor builds the item preview from the mesh itself.
 
             item_id += 1
         elif debug_mode:
