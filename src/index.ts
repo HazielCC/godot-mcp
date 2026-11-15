@@ -1336,7 +1336,12 @@ class GodotServer {
       const lines = result.errors.map((e) => `${e.file}:${e.line}: ${e.message}`).join('\n');
       return `Parse errors in ${label}:\n${lines}`;
     }
-    return `Godot could not check ${label}:\n${result.rawOutput.slice(0, 1500)}`;
+    // Drop Godot's version banner and blank lines so the useful lines come first.
+    const useful = result.rawOutput
+      .split(/\r?\n/)
+      .filter((line) => line.trim() !== '' && !line.startsWith('Godot Engine v'))
+      .join('\n');
+    return `Godot could not check ${label}:\n${useful ? useful.slice(0, 1500) : '(Godot printed no output)'}`;
   }
 
   /**
