@@ -36,6 +36,18 @@ const __dirname = dirname(__filename);
 /**
  * Interface representing a running Godot process
  */
+/** A node read from a .tscn file (see read_scene). */
+interface SceneNodeInfo {
+  name: string;
+  type: string | null;
+  parent: string | null;
+  instance: string | null;
+  // Path such as "root/Player", starting with the root name.
+  path: string;
+  properties: Record<string, string>;
+  children: SceneNodeInfo[];
+}
+
 /** Maximum lines kept per output stream (stdout and stderr) of a running Godot process. */
 const MAX_BUFFERED_LINES = 2000;
 
@@ -53,6 +65,8 @@ const PROJECT_PATH_PARAMS: Record<string, string[]> = {
   save_scene: ['scenePath', 'newPath'],
   export_mesh_library: ['scenePath', 'outputPath'],
   get_uid: ['filePath'],
+  read_scene: ['scenePath'],
+  set_node_property: ['scenePath'],
 };
 
 /** Extensions Godot imports into a .import file and a cached resource (see diagnose_project). */
@@ -1047,6 +1061,54 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'read_scene',
+          description: 'Read an existing .tscn scene as a tree of nodes, with each node\'s type, path (for example "root/Player") and properties, plus its external and sub-resources. Read-only; does not need Godot.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the .tscn file, relative to the project (e.g., "scenes/main.tscn")',
+              },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'set_node_property',
+          description: 'Set one property on a node of an existing scene and save the scene. The value is a Godot literal, such as 42, true, "text", or Vector2(1, 2). The node is named by its path, such as "root/Player". Requires Godot.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the .tscn file, relative to the project',
+              },
+              nodePath: {
+                type: 'string',
+                description: 'Path of the node inside the scene, starting with the root name (e.g., "root/Player")',
+              },
+              property: {
+                type: 'string',
+                description: 'Property name, such as position or texture',
+              },
+              value: {
+                type: 'string',
+                description: 'Godot literal for the new value, such as 42, true, "text", or Vector2(1, 2)',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'nodePath', 'property', 'value'],
+          },
+        },
       ],
     }));
 
@@ -1095,6 +1157,10 @@ class GodotServer {
           return await this.handleRunTests(request.params.arguments);
         case 'diagnose_project':
           return await this.handleDiagnoseProject(request.params.arguments);
+        case 'read_scene':
+          return await this.handleReadScene(request.params.arguments);
+        case 'set_node_property':
+          return await this.handleSetNodeProperty(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -2300,6 +2366,281 @@ class GodotServer {
       ],
       isError: checks.some((c) => c.status === 'error'),
     };
+  }
+
+  /**
+   * Parse the text of a .tscn file into its nodes, external resources and sub-resources.
+   * Handles the format Godot writes: a section header with attributes, then "key = value"
+   * lines that belong to the latest section. Each node's path is "<root>/<child>/...".
+   */
+  private parseSceneText(text: string): {
+    format: string;
+    root: SceneNodeInfo | null;
+    nodeCount: number;
+    extResources: { id: string; type: string; path: string }[];
+    subResources: { id: string; type: string; properties: Record<string, string> }[];
+    orphanNodes: string[];
+  } {
+    const parseAttributes = (raw: string): Record<string, string> => {
+      const attributes: Record<string, string> = {};
+      for (const match of raw.matchAll(/(\w+)=("(?:[^"\\]|\\.)*"|[^\s\]]+)/g)) {
+        attributes[match[1]] = match[2].replace(/^"|"$/g, '');
+      }
+      return attributes;
+    };
+
+    const nodes: SceneNodeInfo[] = [];
+    const extResources: { id: string; type: string; path: string }[] = [];
+    const subResources: { id: string; type: string; properties: Record<string, string> }[] = [];
+    let format = '';
+    let current: { properties: Record<string, string> } | null = null;
+
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (line === '') {
+        continue;
+      }
+
+      const header = /^\[(\w+)(.*)\]$/.exec(line);
+      if (header) {
+        const kind = header[1];
+        const attributes = parseAttributes(header[2]);
+        current = null;
+
+        if (kind === 'gd_scene') {
+          format = attributes.format ?? '';
+        } else if (kind === 'ext_resource') {
+          extResources.push({ id: attributes.id ?? '', type: attributes.type ?? '', path: attributes.path ?? '' });
+        } else if (kind === 'sub_resource') {
+          const sub = { id: attributes.id ?? '', type: attributes.type ?? '', properties: {} as Record<string, string> };
+          subResources.push(sub);
+          current = sub;
+        } else if (kind === 'node') {
+          const node: SceneNodeInfo = {
+            name: attributes.name ?? '',
+            type: attributes.type ?? null,
+            parent: attributes.parent ?? null,
+            instance: attributes.instance ?? null,
+            path: '',
+            properties: {},
+            children: [],
+          };
+          nodes.push(node);
+          current = node;
+        }
+        continue;
+      }
+
+      const property = /^([^=\s]+)\s*=\s*(.*)$/.exec(line);
+      if (property && current) {
+        current.properties[property[1]] = property[2].slice(0, 300);
+      }
+    }
+
+    const root = nodes.find((node) => node.parent === null) ?? null;
+    const orphanNodes: string[] = [];
+    if (root) {
+      root.path = root.name;
+      // Nodes are keyed by their path relative to the root; the root itself is ''.
+      const byRelativePath = new Map<string, SceneNodeInfo>([['', root]]);
+      for (const node of nodes) {
+        if (node === root) {
+          continue;
+        }
+        const parentKey = node.parent === '.' ? '' : (node.parent ?? '');
+        const parentNode = byRelativePath.get(parentKey);
+        if (!parentNode) {
+          orphanNodes.push(node.name);
+          continue;
+        }
+        const relativeKey = parentKey === '' ? node.name : `${parentKey}/${node.name}`;
+        node.path = `${root.name}/${relativeKey}`;
+        parentNode.children.push(node);
+        byRelativePath.set(relativeKey, node);
+      }
+    }
+
+    return { format, root, nodeCount: nodes.length, extResources, subResources, orphanNodes };
+  }
+
+  /**
+   * Handle the read_scene tool: return the node tree of a .tscn scene file.
+   */
+  private async handleReadScene(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (typeof args.projectPath !== 'string' || !args.projectPath || typeof args.scenePath !== 'string' || !args.scenePath) {
+      return this.createErrorResponse(
+        'Project path and scene path are required',
+        ['Provide projectPath and scenePath (relative to the project)']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide valid paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    const projectRoot = resolvePath(args.projectPath);
+    const sceneFile = join(projectRoot, args.scenePath);
+    if (!existsSync(sceneFile) || !statSync(sceneFile).isFile()) {
+      return this.createErrorResponse(
+        `Scene file not found: ${args.scenePath}`,
+        ['Check the path relative to the project directory', 'Use create_scene to create a new scene']
+      );
+    }
+
+    const parsed = this.parseSceneText(readFileSync(sceneFile, 'utf8'));
+    if (!parsed.root) {
+      return this.createErrorResponse(
+        `No root node found in ${args.scenePath}`,
+        ['The file may be empty or not a Godot scene']
+      );
+    }
+
+    // A readable outline first, then the full structure for programmatic use.
+    const outline: string[] = [];
+    const walk = (node: SceneNodeInfo, depth: number) => {
+      outline.push(`${'  '.repeat(depth)}- ${node.name} (${node.type ?? (node.instance ? 'instance' : 'unknown')}) ${node.path}`);
+      for (const child of node.children) {
+        walk(child, depth + 1);
+      }
+    };
+    walk(parsed.root, 0);
+
+    const summary = [
+      `Scene ${args.scenePath}: ${parsed.nodeCount} nodes, ${parsed.extResources.length} external resources, ${parsed.subResources.length} sub-resources`,
+      ...outline,
+    ];
+    if (parsed.orphanNodes.length > 0) {
+      summary.push('', `Nodes whose parent was not found: ${parsed.orphanNodes.join(', ')}`);
+    }
+
+    return {
+      content: [
+        { type: 'text', text: summary.join('\n') },
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              format: parsed.format,
+              root: parsed.root,
+              extResources: parsed.extResources,
+              subResources: parsed.subResources,
+              orphanNodes: parsed.orphanNodes,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+
+  /**
+   * Handle the set_node_property tool: change one property on a node and save the scene.
+   */
+  private async handleSetNodeProperty(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (
+      typeof args.projectPath !== 'string' || !args.projectPath ||
+      typeof args.scenePath !== 'string' || !args.scenePath ||
+      typeof args.nodePath !== 'string' || !args.nodePath ||
+      typeof args.property !== 'string' || !args.property ||
+      typeof args.value !== 'string'
+    ) {
+      return this.createErrorResponse(
+        'Missing required parameters',
+        ['Provide projectPath, scenePath, nodePath, property, and value (value is a Godot literal, such as 42 or Vector2(1, 2))']
+      );
+    }
+
+    if (
+      !this.validatePath(args.projectPath) ||
+      !this.validatePath(args.scenePath) ||
+      !this.validatePath(args.nodePath)
+    ) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide valid paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    if (!/^[A-Za-z_][\w/]*$/.test(args.property)) {
+      return this.createErrorResponse(
+        `Invalid property name: ${args.property}`,
+        ['Use a property name such as position, texture or metadata/key']
+      );
+    }
+
+    const projectRoot = resolvePath(args.projectPath);
+    if (!existsSync(join(projectRoot, 'project.godot'))) {
+      return this.createErrorResponse(
+        `Not a valid Godot project: ${args.projectPath}`,
+        ['Ensure the path points to a directory containing a project.godot file']
+      );
+    }
+
+    if (!existsSync(join(projectRoot, args.scenePath))) {
+      return this.createErrorResponse(
+        `Scene file not found: ${args.scenePath}`,
+        ['Check the path relative to the project directory']
+      );
+    }
+
+    try {
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+        if (!this.godotPath) {
+          return this.createErrorResponse(
+            'Could not find a valid Godot executable path',
+            [
+              'Ensure Godot is installed correctly',
+              'Set GODOT_PATH environment variable to specify the correct path',
+            ]
+          );
+        }
+      }
+
+      const { stdout, stderr } = await this.executeOperation(
+        'set_node_property',
+        {
+          scenePath: args.scenePath,
+          nodePath: args.nodePath,
+          property: args.property,
+          value: args.value,
+        },
+        args.projectPath
+      );
+
+      const failure = `${stdout}\n${stderr}`.split(/\r?\n/).find((line) => line.includes('Failed to'));
+      if (failure) {
+        return this.createErrorResponse(
+          failure.trim(),
+          [
+            'Check the node path with read_scene (it starts with the root name, for example root/Player)',
+            'Check that the value is a valid Godot literal, such as 42, true, "text" or Vector2(1, 2)',
+          ]
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Set ${args.property} on ${args.nodePath} in ${args.scenePath} and saved the scene.`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to set property: ${error?.message || 'Unknown error'}`,
+        ['Ensure Godot is installed and GODOT_PATH is set correctly']
+      );
+    }
   }
 
   /**
