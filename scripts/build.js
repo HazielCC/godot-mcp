@@ -38,8 +38,8 @@ try {
     path.join(__dirname, '..', 'build', 'scripts', 'render_scene_3d.gd')
   );
 
-  // Copy render_scene_ui.gd and inspect_ui.gd used by the UI tools
-  for (const script of ['render_scene_ui.gd', 'inspect_ui.gd']) {
+  // Copy render_scene_ui.gd, inspect_ui.gd and render_particles.gd used by the UI and particle tools
+  for (const script of ['render_scene_ui.gd', 'inspect_ui.gd', 'render_particles.gd']) {
     fs.copyFileSync(
       path.join(__dirname, '..', 'src', 'scripts', script),
       path.join(__dirname, '..', 'build', 'scripts', script)

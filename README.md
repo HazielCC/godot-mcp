@@ -225,6 +225,18 @@ These need Godot 4.3 or later. `build_ui` and `make_theme` work headless. The fo
 
 To try them, run `node scripts/fixtures/make-ui-fixture.mjs`. It writes a project with a menu that has defects on purpose (`scenes/broken.tscn`), and prints its path.
 
+### Particle tools
+
+These work in 2D and 3D and need Godot 4.3 or later. `create_particles` and `tune_particles` work headless; `render_particles` opens a short-lived Godot window, so it needs a display and a graphics driver.
+
+| Tool | What it does |
+|------|--------------|
+| `create_particles` | Adds a particle system from a preset (`fire`, `smoke`, `sparks`, `explosion`, `rain`, `snow`, `magic`, `dust`), with any value changed: `amount`, `lifetime`, `oneShot`, `explosiveness`, `shape`/`extent`, `direction`, `spread`, `speedMin`/`speedMax`, `gravity`, `scaleMin`/`scaleMax`, `colors` (1 to 4, birth to death), `blend` (`add` or `mix`), `texture` (`soft`, `spark`, `streak`) or your own `texturePath`, `turbulence`. It builds the node, its `ParticleProcessMaterial`, scale curve, color ramp, texture and (in 3D) a billboard mesh. `cpu: true` makes `CPUParticles` for weak devices |
+| `tune_particles` | Changes values of an existing `GPUParticles2D`/`GPUParticles3D` node; only what you pass changes |
+| `render_particles` | Plays the scene's particles and takes pictures at the times you choose, side by side in one PNG. For each one it measures what the particles add to the picture: coverage, bounding box and brightness. It reports an error when nothing is visible. The pictures use a fixed random seed, so the same scene gives the same result |
+
+Presets are written in meters. In 2D, lengths, speeds and gravity are multiplied by 64 (pixels per meter) and +Y is still "up" in `direction` and `gravity`.
+
 ## Building from source
 
 Use this if you want to modify the server or run a local copy:

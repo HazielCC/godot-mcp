@@ -86,7 +86,7 @@ type TestState = { directory: string; savedAt: string; tests: TestRecord[] };
  */
 const REPACKING_OPERATIONS = [
   'add_node', 'load_sprite', 'set_node_property', 'save_scene', 'import_spritesheet', 'auto_collision',
-  'build_tilemap', 'setup_parallax_2d', 'build_blockout', 'create_pbr_material', 'bake_navmesh', 'build_ui', 'make_theme',
+  'build_tilemap', 'setup_parallax_2d', 'build_blockout', 'create_pbr_material', 'bake_navmesh', 'build_ui', 'make_theme', 'create_particles', 'tune_particles',
 ];
 
 /** The buffer line of each MultiMesh in a scene text, by the key of the node that uses it. */
@@ -386,6 +386,9 @@ const PROJECT_PATH_PARAMS: Record<string, string[]> = {
   ui_lint: ['scenePath'],
   ui_check_focus: ['scenePath'],
   ui_check_contrast: ['scenePath'],
+  create_particles: ['scenePath', 'texturePath'],
+  tune_particles: ['scenePath', 'texturePath'],
+  render_particles: ['scenePath'],
 };
 
 
@@ -440,6 +443,7 @@ class GodotServer {
   private renderScene3dPath: string;
   private renderSceneUiPath: string;
   private inspectUiPath: string;
+  private renderParticlesPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
   private godotDebugMode: boolean = GODOT_DEBUG_MODE;
@@ -512,6 +516,7 @@ class GodotServer {
     this.renderScene3dPath = join(__dirname, 'scripts', 'render_scene_3d.gd');
     this.renderSceneUiPath = join(__dirname, 'scripts', 'render_scene_ui.gd');
     this.inspectUiPath = join(__dirname, 'scripts', 'inspect_ui.gd');
+    this.renderParticlesPath = join(__dirname, 'scripts', 'render_particles.gd');
     if (debugMode) console.error(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
 
     // Initialize the MCP server
@@ -1909,6 +1914,94 @@ class GodotServer {
             required: ['projectPath', 'scenePath'],
           },
         },
+        {
+          name: 'create_particles',
+          description: 'Add a particle system to a scene from a preset (fire, smoke, sparks, explosion, rain, snow, magic, dust), with any value of the preset changed. It makes the node, its ParticleProcessMaterial, curves, color ramp, texture and (in 3D) a billboard mesh. Works in 2D and 3D, and can make CPU particles for weak devices. Use render_particles to see the result.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project (it must not inherit from another scene)' },
+              dimension: { type: 'string', enum: ['2d', '3d'], description: 'Default 3d' },
+              nodeName: { type: 'string', description: 'Name of the node. Default: the preset name' },
+              parentNodePath: { type: 'string', description: 'Parent of the node. Default: the scene root' },
+              position: { type: 'array', items: { type: 'number' }, description: 'Position [x, y] in 2D or [x, y, z] in 3D' },
+              size: { type: 'number', description: 'Size of each particle in meters (pixels / 64 in 2D)' },
+              cpu: { type: 'boolean', description: 'Make CPUParticles instead of GPUParticles. Default false' },
+              preset: { type: 'string', enum: ['fire', 'smoke', 'sparks', 'explosion', 'rain', 'snow', 'magic', 'dust'], description: 'Starting point. Default fire' },
+              amount: { type: 'number', description: 'Number of particles alive at once, 1 to 5000' },
+              lifetime: { type: 'number', description: 'Seconds a particle lives, 0.05 to 60' },
+              oneShot: { type: 'boolean', description: 'Emit once instead of continuously' },
+              explosiveness: { type: 'number', description: '0 spreads the births over the lifetime, 1 makes them all at once' },
+              emitting: { type: 'boolean', description: 'Start emitting. Default true' },
+              shape: { type: 'string', enum: ['point', 'sphere', 'box', 'ring'], description: 'Where particles are born' },
+              extent: { description: 'Size of that shape in meters (pixels / 64 in 2D): a radius for sphere and ring, half sizes [x, y, z] for box' },
+              direction: { type: 'array', items: { type: 'number' }, description: 'Where they go, [x, y, z] with +Y up (also in 2D)' },
+              spread: { type: 'number', description: 'Cone angle around the direction in degrees, 0 to 180' },
+              speedMin: { type: 'number', description: 'Slowest start speed in meters per second (pixels / 64 in 2D)' },
+              speedMax: { type: 'number', description: 'Fastest start speed' },
+              gravity: { type: 'array', items: { type: 'number' }, description: 'Acceleration [x, y, z] with +Y up. [0, 1, 0] makes particles rise' },
+              scaleMin: { type: 'number', description: 'Smallest scale of a particle' },
+              scaleMax: { type: 'number', description: 'Largest scale of a particle' },
+              colors: { type: 'array', items: { type: 'string' }, description: '1 to 4 colors "#rrggbb" for the life of a particle, from birth to death. They fade out at the end' },
+              blend: { type: 'string', enum: ['add', 'mix'], description: 'add makes light (fire, magic); mix is for smoke and snow' },
+              texture: { type: 'string', enum: ['soft', 'spark', 'streak'], description: 'Generated shape of each particle' },
+              texturePath: { type: 'string', description: 'Your own texture, relative to the project, instead of a generated one' },
+              turbulence: { type: 'number', description: 'Strength of the swirling noise, 0 for none' },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'tune_particles',
+          description: 'Change values of an existing GPUParticles2D or GPUParticles3D node: only what you pass changes. The units and options are the same as in create_particles.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project' },
+              nodePath: { type: 'string', description: 'The particles node, starting with the root name, for example "Main/Fire"' },
+              amount: { type: 'number', description: 'Number of particles alive at once, 1 to 5000' },
+              lifetime: { type: 'number', description: 'Seconds a particle lives, 0.05 to 60' },
+              oneShot: { type: 'boolean', description: 'Emit once instead of continuously' },
+              explosiveness: { type: 'number', description: '0 spreads the births over the lifetime, 1 makes them all at once' },
+              emitting: { type: 'boolean', description: 'Start emitting. Default true' },
+              shape: { type: 'string', enum: ['point', 'sphere', 'box', 'ring'], description: 'Where particles are born' },
+              extent: { description: 'Size of that shape in meters (pixels / 64 in 2D): a radius for sphere and ring, half sizes [x, y, z] for box' },
+              direction: { type: 'array', items: { type: 'number' }, description: 'Where they go, [x, y, z] with +Y up (also in 2D)' },
+              spread: { type: 'number', description: 'Cone angle around the direction in degrees, 0 to 180' },
+              speedMin: { type: 'number', description: 'Slowest start speed in meters per second (pixels / 64 in 2D)' },
+              speedMax: { type: 'number', description: 'Fastest start speed' },
+              gravity: { type: 'array', items: { type: 'number' }, description: 'Acceleration [x, y, z] with +Y up. [0, 1, 0] makes particles rise' },
+              scaleMin: { type: 'number', description: 'Smallest scale of a particle' },
+              scaleMax: { type: 'number', description: 'Largest scale of a particle' },
+              colors: { type: 'array', items: { type: 'string' }, description: '1 to 4 colors "#rrggbb" for the life of a particle, from birth to death. They fade out at the end' },
+              blend: { type: 'string', enum: ['add', 'mix'], description: 'add makes light (fire, magic); mix is for smoke and snow' },
+              texture: { type: 'string', enum: ['soft', 'spark', 'streak'], description: 'Generated shape of each particle' },
+              texturePath: { type: 'string', description: 'Your own texture, relative to the project, instead of a generated one' },
+              turbulence: { type: 'number', description: 'Strength of the swirling noise, 0 for none' },
+            },
+            required: ['projectPath', 'scenePath', 'nodePath'],
+          },
+        },
+        {
+          name: 'render_particles',
+          description: 'Play the particles of a scene and take pictures at chosen moments, side by side in one PNG, with measurements for each: how much of the picture the particles cover, the box that holds them and their brightness. Reports an error when nothing is visible. The pictures use a fixed random seed, so the same scene gives the same result. It opens a short-lived Godot window, so it needs a display and a graphics driver (it does not work headless).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file with GPUParticles or CPUParticles, relative to the project' },
+              times: { type: 'array', items: { type: 'number' }, description: 'Seconds after the start, 1 to 8 values in ascending order. Default [0.1, 0.4, 0.8]' },
+              width: { type: 'number', description: 'Width of each picture, 64 to 1024. Default 256' },
+              height: { type: 'number', description: 'Height of each picture, 64 to 1024. Default 256' },
+              zoom: { type: 'number', description: '2D zoom of the camera. Default 1' },
+              radius: { type: 'number', description: '3D: meters the camera frames around the emitter. Default: taken from the emitter' },
+              background: { type: 'string', description: 'Color behind the particles, "#rrggbb". Default black' },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
       ],
     }));
 
@@ -1997,6 +2090,12 @@ class GodotServer {
           return await this.handleUiInspect('focus', request.params.arguments);
         case 'ui_check_contrast':
           return await this.handleUiInspect('contrast', request.params.arguments);
+        case 'create_particles':
+          return await this.handleCreateParticles(request.params.arguments);
+        case 'tune_particles':
+          return await this.handleTuneParticles(request.params.arguments);
+        case 'render_particles':
+          return await this.handleRenderParticles(request.params.arguments);
         case 'read_scene':
           return await this.handleReadScene(request.params.arguments);
         case 'set_node_property':
@@ -5646,6 +5745,175 @@ class GodotServer {
           { type: 'text', text: JSON.stringify({ scene: args.scenePath, mode, results }, null, 2) },
         ],
         isError: failing > 0,
+      };
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  /** Check the options that create_particles and tune_particles share. Returns the first problem, or undefined. */
+  private checkParticleArgs(args: any): string | undefined {
+    const problem = this.checkNumbers(args, {
+      lifetime: [0.05, 60], explosiveness: [0, 1], spread: [0, 180], speedMin: [0, 1000], speedMax: [0, 1000],
+      scaleMin: [0, 100], scaleMax: [0, 100], size: [0.001, 100], turbulence: [0, 20],
+    });
+    if (problem) {
+      return problem;
+    }
+    if (args.amount !== undefined && !(Number.isInteger(args.amount) && args.amount >= 1 && args.amount <= 5000)) {
+      return 'amount must be a whole number from 1 to 5000';
+    }
+    for (const key of ['oneShot', 'emitting', 'cpu']) {
+      if (args[key] !== undefined && typeof args[key] !== 'boolean') {
+        return `${key} must be true or false`;
+      }
+    }
+    if (args.shape !== undefined && !['point', 'sphere', 'box', 'ring'].includes(args.shape)) {
+      return 'shape must be point, sphere, box or ring';
+    }
+    if (args.blend !== undefined && !['add', 'mix'].includes(args.blend)) {
+      return 'blend must be add or mix';
+    }
+    if (args.texture !== undefined && !['soft', 'spark', 'streak'].includes(args.texture)) {
+      return 'texture must be soft, spark or streak';
+    }
+    for (const key of ['direction', 'gravity', 'position']) {
+      const value = args[key];
+      if (value !== undefined && !(Array.isArray(value) && value.length >= 2 && value.length <= 3 && value.every((n: unknown) => typeof n === 'number' && Number.isFinite(n)))) {
+        return `${key} must be a list of 2 or 3 numbers`;
+      }
+    }
+    if (args.extent !== undefined && !(typeof args.extent === 'number' && args.extent >= 0) && !(Array.isArray(args.extent) && args.extent.length >= 2 && args.extent.length <= 3 && args.extent.every((n: unknown) => typeof n === 'number' && Number.isFinite(n)))) {
+      return 'extent must be a number, or a list of 2 or 3 numbers';
+    }
+    if (args.colors !== undefined && !(Array.isArray(args.colors) && args.colors.length >= 1 && args.colors.length <= 4 && args.colors.every((c: unknown) => typeof c === 'string' && /^#[0-9a-fA-F]{6}$/.test(c)))) {
+      return 'colors must be 1 to 4 colors like #ffaa00';
+    }
+    if (args.texturePath !== undefined && typeof args.texturePath !== 'string') {
+      return 'texturePath must be text';
+    }
+    if (args.nodeName !== undefined && !this.isSafeNodeName(args.nodeName)) {
+      return 'Invalid nodeName: it cannot contain slashes, quotes, dots, colons, @ or %';
+    }
+    return undefined;
+  }
+
+  private static readonly PARTICLE_OPTION_KEYS = [
+    'amount', 'lifetime', 'oneShot', 'explosiveness', 'emitting', 'shape', 'extent', 'direction', 'spread', 'speedMin', 'speedMax',
+    'gravity', 'scaleMin', 'scaleMax', 'colors', 'blend', 'texture', 'texturePath', 'turbulence',
+  ];
+
+  /** Handle the create_particles tool */
+  private async handleCreateParticles(rawArgs: any) {
+    return this.runEditTool(rawArgs, {
+      operation: 'create_particles',
+      label: 'create_particles',
+      required: ['scenePath'],
+      build: (args) => {
+        if (args.preset !== undefined && !['fire', 'smoke', 'sparks', 'explosion', 'rain', 'snow', 'magic', 'dust'].includes(args.preset)) {
+          return { error: 'preset must be fire, smoke, sparks, explosion, rain, snow, magic or dust' };
+        }
+        if (args.dimension !== undefined && args.dimension !== '2d' && args.dimension !== '3d') {
+          return { error: 'dimension must be 2d or 3d' };
+        }
+        const problem = this.checkParticleArgs(args);
+        if (problem) {
+          return { error: problem };
+        }
+        return {
+          params: this.pickParams(args, ['preset', 'dimension', 'nodeName', 'parentNodePath', 'position', 'size', 'cpu', ...GodotServer.PARTICLE_OPTION_KEYS], { scenePath: args.scenePath }),
+        };
+      },
+      summary: (r) => `Added ${r.node} (${r.class}, preset ${r.preset}, ${r.amount} particles, ${r.lifetime} s).`,
+    });
+  }
+
+  /** Handle the tune_particles tool */
+  private async handleTuneParticles(rawArgs: any) {
+    return this.runEditTool(rawArgs, {
+      operation: 'tune_particles',
+      label: 'tune_particles',
+      required: ['scenePath', 'nodePath'],
+      build: (args) => {
+        const problem = this.checkParticleArgs(args);
+        if (problem) {
+          return { error: problem };
+        }
+        if (args.size !== undefined) {
+          return { error: 'size can only be set in create_particles; use scaleMin and scaleMax to resize an existing system' };
+        }
+        const params = this.pickParams(args, GodotServer.PARTICLE_OPTION_KEYS, { scenePath: args.scenePath, nodePath: args.nodePath });
+        if (Object.keys(params).length <= 2) {
+          return { error: 'Pass at least one value to change' };
+        }
+        return { params };
+      },
+      summary: (r) => `Changed ${r.changed.join(', ')} on ${r.node}.`,
+    });
+  }
+
+  /** Handle the render_particles tool: a contact sheet of moments of the particles, with measurements. */
+  private async handleRenderParticles(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    if (typeof args.projectPath !== 'string' || !args.projectPath || typeof args.scenePath !== 'string' || !args.scenePath) {
+      return this.createErrorResponse('projectPath and scenePath are required', ['Provide both as text'], { code: 'INVALID_ARGUMENT' });
+    }
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse('Invalid project path', ['Provide a valid path without ".." segments'], { code: 'INVALID_PATH' });
+    }
+    const times: unknown = args.times ?? [0.1, 0.4, 0.8];
+    if (!Array.isArray(times) || times.length < 1 || times.length > 8 || !times.every((t, i) => typeof t === 'number' && t >= 0 && t <= 30 && (i === 0 || t > (times as number[])[i - 1]))) {
+      return this.createErrorResponse('times must be 1 to 8 numbers from 0 to 30, each larger than the one before', ['Check times'], { code: 'INVALID_ARGUMENT' });
+    }
+    const problem = this.checkNumbers(args, { width: [64, 1024], height: [64, 1024], zoom: [0.05, 20], radius: [0, 1000] });
+    if (problem) {
+      return this.createErrorResponse(problem, ['Check the numbers'], { code: 'INVALID_ARGUMENT' });
+    }
+    if (args.background !== undefined && !/^#[0-9a-fA-F]{6}$/.test(String(args.background))) {
+      return this.createErrorResponse('background must look like #101010', ['Check background'], { code: 'INVALID_ARGUMENT' });
+    }
+    const projectRoot = resolvePath(args.projectPath);
+    if (!existsSync(join(projectRoot, 'project.godot'))) {
+      return this.createErrorResponse(`Not a valid Godot project: ${args.projectPath}`, ['Ensure the path points to a directory containing a project.godot file'], { code: 'PROJECT_NOT_FOUND' });
+    }
+    if (!existsSync(join(projectRoot, args.scenePath))) {
+      return this.createErrorResponse(`Scene file does not exist: ${args.scenePath}`, ['Check the path relative to the project'], { code: 'INVALID_PATH' });
+    }
+
+    const tempDir = mkdtempSync(join(tmpdir(), 'godot-mcp-particles-'));
+    try {
+      const sheet = join(tempDir, 'sheet.png');
+      const report = join(tempDir, 'report.json');
+      const ran = await this.runWindowedScript(
+        this.renderParticlesPath,
+        projectRoot,
+        [
+          `res://${args.scenePath}`, sheet, report, (times as number[]).join(','), String(args.width ?? 256), String(args.height ?? 256),
+          String(args.zoom ?? 1), String(args.background ?? '#000000'), String(args.radius ?? 0),
+        ],
+        120000
+      );
+      if ('error' in ran) {
+        return ran.error;
+      }
+      if (!existsSync(sheet) || !existsSync(report)) {
+        const reason = ran.output.split(/\r?\n/).find((line) => line.startsWith('RENDER_FAIL')) ?? ran.output.trim().split(/\r?\n/).slice(-3).join('\n');
+        return this.createErrorResponse(
+          `Godot did not render the particles: ${reason || 'no output'}`,
+          ['This tool needs a display and a graphics driver; it cannot run headless or without a display', 'Check the scene with check_project_scripts']
+        );
+      }
+      const result = JSON.parse(readFileSync(report, 'utf8'));
+      const scriptErrors = this.groupScriptErrors(this.parseScriptErrors(ran.output));
+      const lines = (result.frames as any[]).map((f) => `t=${f.t} s: covers ${(f.coverage * 100).toFixed(1)} % of the picture, brightness ${f.mean_brightness}`);
+      const hasError = (result.issues as any[]).some((i) => i.severity === 'error') || scriptErrors.scriptErrors.length > 0;
+      return {
+        content: [
+          { type: 'text', text: [`Particles of ${args.scenePath}`, ...lines, ...(result.issues as any[]).map((i) => `[${i.severity}] ${i.message}. ${i.suggestion}`)].join('\n') },
+          { type: 'text', text: JSON.stringify({ scene: args.scenePath, ...result, scriptErrors: scriptErrors.scriptErrors }, null, 2) },
+          { type: 'image', data: readFileSync(sheet).toString('base64'), mimeType: 'image/png' },
+        ],
+        isError: hasError,
       };
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
