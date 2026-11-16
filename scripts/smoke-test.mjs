@@ -39,6 +39,11 @@ const EXPECTED_TOOLS = [
   'build_tilemap',
   'setup_parallax_2d',
   'render_scene_2d',
+  'build_blockout',
+  'create_pbr_material',
+  'scatter_multimesh',
+  'bake_navmesh',
+  'render_scene_3d',
 ];
 
 const TIMEOUT_MS = 15000;

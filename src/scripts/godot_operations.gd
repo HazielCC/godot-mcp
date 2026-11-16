@@ -4,6 +4,10 @@ extends SceneTree
 # Debug mode flag
 var debug_mode: bool = false
 
+# Set by _fail; operations that finish after _init use it to keep their error exit code.
+var _failed: bool = false
+var _deferred_params: Dictionary = {}
+
 func _init() -> void:
     var args: PackedStringArray = OS.get_cmdline_args()
 
@@ -83,6 +87,17 @@ func _init() -> void:
             build_tilemap(params)
         "setup_parallax_2d":
             setup_parallax_2d(params)
+        "build_blockout":
+            build_blockout(params)
+        "create_pbr_material":
+            create_pbr_material(params)
+        "extract_mesh":
+            extract_mesh(params)
+        "bake_navmesh":
+            # Reading geometry needs the scene inside a running tree, which only exists after _init.
+            _deferred_params = params
+            process_frame.connect(_run_bake_navmesh, CONNECT_ONE_SHOT)
+            return
         _:
             log_error("Unknown operation: " + operation)
             quit(1)
@@ -1491,8 +1506,14 @@ func _res_path(path: String) -> String:
 
 # Reports a failure. quit() does not stop the script, so callers return right after this.
 func _fail(message: String) -> void:
+    _failed = true
     printerr("Failed to " + message)
     quit(1)
+
+func _run_bake_navmesh() -> void:
+    bake_navmesh(_deferred_params)
+    if not _failed:
+        quit()
 
 func _result(data: Dictionary) -> void:
     print("RESULT " + JSON.stringify(data))
@@ -1907,3 +1928,353 @@ func setup_parallax_2d(params: Dictionary) -> void:
         return
     scene_root.free()
     _result({"layers": created})
+
+
+# ---------------------------------------------------------------------------
+# 3D tools: build_blockout, create_pbr_material, bake_navmesh.
+# Same conventions as the 2D tools above: "RESULT <json>" on success, "Failed to ..." on stderr.
+# ---------------------------------------------------------------------------
+
+# Greybox level from rows of text. Each character of the legend has a height, an optional elevation,
+# a color and a collision flag. A run of equal characters in a row becomes one box.
+func build_blockout(params: Dictionary) -> void:
+    var what: String = "build blockout"
+    var scene_root: Node = _open_scene_root(str(params.scene_path), what)
+    if scene_root == null:
+        return
+    var parent: Node = _resolve_parent(scene_root, params)
+    if parent == null:
+        _fail(what + ": parent node not found: " + str(params.get("parent_node_path", "")))
+        scene_root.free()
+        return
+    var container_name: String = str(params.get("node_name", "Blockout"))
+    if parent.get_node_or_null(container_name) != null:
+        _fail(what + ": a node named " + container_name + " already exists under the parent")
+        scene_root.free()
+        return
+
+    var cell_size: float = float(params.get("cell_size", 2.0))
+    var styles: Dictionary = {}
+    for entry: Variant in params.legend:
+        var item: Dictionary = entry as Dictionary
+        var material: StandardMaterial3D = StandardMaterial3D.new()
+        material.albedo_color = Color.html(str(item.get("color", "#9a9a9a"))) if Color.html_is_valid(str(item.get("color", "#9a9a9a"))) else Color(0.6, 0.6, 0.6)
+        styles[str(item.get("char", ""))] = {
+            "height": float(item.get("height", 1.0)),
+            "elevation": float(item.get("elevation", 0.0)),
+            "collision": bool(item.get("collision", true)),
+            "material": material,
+        }
+
+    var container: Node3D = Node3D.new()
+    container.name = container_name
+    parent.add_child(container)
+    container.owner = scene_root
+
+    var origin_x: int = int(params.get("origin_x", 0))
+    var origin_z: int = int(params.get("origin_z", 0))
+    var rows: Array = params.rows
+    var runs: int = 0
+    var cells: int = 0
+    for z: int in range(rows.size()):
+        var row: String = str(rows[z])
+        var x: int = 0
+        while x < row.length():
+            var character: String = row[x]
+            if character == "." or character == " ":
+                x += 1
+                continue
+            if not styles.has(character):
+                _fail(what + ": the character '" + character + "' (row " + str(z) + ", column " + str(x) + ") is not in the legend")
+                container.free()
+                scene_root.free()
+                return
+            var end: int = x
+            while end < row.length() and row[end] == character:
+                end += 1
+            var count: int = end - x
+            var style: Dictionary = styles[character]
+            var height: float = style.height
+            var size: Vector3 = Vector3(count * cell_size, height, cell_size)
+            var box: BoxMesh = BoxMesh.new()
+            box.size = size
+            box.material = style.material
+            var mesh_instance: MeshInstance3D = MeshInstance3D.new()
+            mesh_instance.mesh = box
+            var holder: Node3D = mesh_instance
+            if style.collision:
+                holder = StaticBody3D.new()
+                mesh_instance.name = "Mesh"
+            holder.name = "Run_" + str(z) + "_" + str(x)
+            holder.position = Vector3((origin_x + x + count / 2.0) * cell_size, float(style.elevation) + height / 2.0, (origin_z + z + 0.5) * cell_size)
+            container.add_child(holder)
+            holder.owner = scene_root
+            if style.collision:
+                holder.add_child(mesh_instance)
+                mesh_instance.owner = scene_root
+                var shape: CollisionShape3D = CollisionShape3D.new()
+                var box_shape: BoxShape3D = BoxShape3D.new()
+                box_shape.size = size
+                shape.shape = box_shape
+                shape.name = "Shape"
+                holder.add_child(shape)
+                shape.owner = scene_root
+            runs += 1
+            cells += count
+            x = end
+
+    if runs == 0:
+        _fail(what + ": the rows have no cells to build")
+        container.free()
+        scene_root.free()
+        return
+    if not _save_scene_root(scene_root, str(params.scene_path), what):
+        scene_root.free()
+        return
+    scene_root.free()
+    _result({"node": container_name, "boxes": runs, "cells": cells, "cell_size": cell_size})
+
+# Which material slot a texture file belongs to, from the words in its file name. Returns "" when none.
+func _pbr_slot(file_name: String) -> String:
+    var words: PackedStringArray = file_name.get_basename().to_lower().replace("-", "_").replace(" ", "_").replace(".", "_").split("_", false)
+    var table: Array = [
+        ["orm", ["orm", "arm"]],
+        ["normal", ["normal", "nor", "nrm", "norm"]],
+        ["albedo", ["albedo", "basecolor", "base", "color", "diffuse", "diff", "col"]],
+        ["roughness", ["roughness", "rough", "rgh"]],
+        ["metallic", ["metallic", "metalness", "metal", "mtl"]],
+        ["ao", ["ao", "occlusion", "ambientocclusion"]],
+        ["emission", ["emission", "emissive", "emit"]],
+        ["height", ["height", "displacement", "disp", "bump"]],
+    ]
+    for pair: Array in table:
+        for word: String in pair[1]:
+            if word in words:
+                return str(pair[0])
+    return ""
+
+# StandardMaterial3D from a folder of texture files named like brick_albedo.png, brick_normal.png, brick_roughness.png.
+func create_pbr_material(params: Dictionary) -> void:
+    var what: String = "create material"
+    var folder: String = _res_path(str(params.folder))
+    var output_path: String = _res_path(str(params.output_path))
+    var dir: DirAccess = DirAccess.open(folder)
+    if dir == null:
+        _fail(what + ": could not open the folder " + folder)
+        return
+
+    var chosen: Dictionary = {}
+    var ignored: Array = []
+    for file_name: String in dir.get_files():
+        var extension: String = file_name.get_extension().to_lower()
+        if not (extension in ["png", "jpg", "jpeg", "webp", "tga", "exr", "bmp"]):
+            continue
+        var slot: String = _pbr_slot(file_name)
+        if slot == "":
+            ignored.append(file_name)
+            continue
+        if chosen.has(slot):
+            # Two normal maps are usually OpenGL and DirectX; Godot uses OpenGL.
+            var lower: String = file_name.to_lower()
+            if "gl" in lower.get_basename().replace("-", "_").split("_", false) and not ("gl" in str(chosen[slot]).to_lower().get_basename().replace("-", "_").split("_", false)):
+                ignored.append(chosen[slot])
+                chosen[slot] = file_name
+            else:
+                ignored.append(file_name)
+            continue
+        chosen[slot] = file_name
+    if chosen.is_empty():
+        _fail(what + ": no texture in " + folder + " has a name with albedo, normal, roughness, metallic, ao, orm, emission or height")
+        return
+
+    var textures: Dictionary = {}
+    for slot: String in chosen:
+        var texture: Texture2D = load(folder.path_join(str(chosen[slot]))) as Texture2D
+        if texture == null:
+            _fail(what + ": could not load " + str(chosen[slot]) + "; the project may need importing (godot --headless --import)")
+            return
+        textures[slot] = texture
+
+    var material: StandardMaterial3D = StandardMaterial3D.new()
+    if textures.has("albedo"):
+        material.albedo_texture = textures.albedo
+    if textures.has("normal"):
+        material.normal_enabled = true
+        material.normal_texture = textures.normal
+    if textures.has("orm"):
+        # Packed map: occlusion in red, roughness in green, metallic in blue.
+        material.ao_enabled = true
+        material.ao_texture = textures.orm
+        material.ao_texture_channel = BaseMaterial3D.TEXTURE_CHANNEL_RED
+        material.roughness_texture = textures.orm
+        material.roughness_texture_channel = BaseMaterial3D.TEXTURE_CHANNEL_GREEN
+        material.metallic_texture = textures.orm
+        material.metallic_texture_channel = BaseMaterial3D.TEXTURE_CHANNEL_BLUE
+    else:
+        if textures.has("roughness"):
+            material.roughness_texture = textures.roughness
+        if textures.has("metallic"):
+            material.metallic = 1.0
+            material.metallic_texture = textures.metallic
+        if textures.has("ao"):
+            material.ao_enabled = true
+            material.ao_texture = textures.ao
+    if textures.has("emission"):
+        material.emission_enabled = true
+        material.emission_texture = textures.emission
+    if textures.has("height"):
+        material.heightmap_enabled = true
+        material.heightmap_texture = textures.height
+    var uv_scale: float = float(params.get("uv_scale", 1.0))
+    material.uv1_scale = Vector3(uv_scale, uv_scale, uv_scale)
+    material.uv1_triplanar = bool(params.get("triplanar", false))
+
+    _make_parent_dir(output_path)
+    var save_error: Error = ResourceSaver.save(material, output_path)
+    if save_error != OK:
+        _fail(what + ": could not save " + output_path + ", error " + str(save_error))
+        return
+
+    var assigned: String = ""
+    if params.has("scene_path"):
+        var scene_root: Node = _open_scene_root(str(params.scene_path), what)
+        if scene_root == null:
+            return
+        var target: GeometryInstance3D = _find_node(scene_root, str(scene_root.name), str(params.get("node_path", ""))) as GeometryInstance3D
+        if target == null:
+            _fail(what + ": " + str(params.get("node_path", "")) + " is not a MeshInstance3D or other GeometryInstance3D in the scene")
+            scene_root.free()
+            return
+        target.material_override = ResourceLoader.load(output_path, "Material", ResourceLoader.CACHE_MODE_REPLACE) as Material
+        if not _save_scene_root(scene_root, str(params.scene_path), what):
+            scene_root.free()
+            return
+        assigned = str(params.node_path)
+        scene_root.free()
+
+    var slots: Array = chosen.keys()
+    slots.sort()
+    _result({"output": output_path, "maps": chosen, "slots": slots, "ignored": ignored, "assigned_to": assigned})
+
+func _strip_scripts(node: Node) -> void:
+    node.set_script(null)
+    for child: Node in node.get_children():
+        _strip_scripts(child)
+
+# Bakes a navigation mesh from the geometry of a scene and adds it in a NavigationRegion3D.
+func bake_navmesh(params: Dictionary) -> void:
+    var what: String = "bake navmesh"
+    var scene_root: Node = _open_scene_root(str(params.scene_path), what)
+    if scene_root == null:
+        return
+    var parent: Node = _resolve_parent(scene_root, params)
+    if parent == null:
+        _fail(what + ": parent node not found: " + str(params.get("parent_node_path", "")))
+        scene_root.free()
+        return
+    var region_name: String = str(params.get("node_name", "NavigationRegion3D"))
+    if parent.get_node_or_null(region_name) != null:
+        _fail(what + ": a node named " + region_name + " already exists under the parent")
+        scene_root.free()
+        return
+
+    var navigation_mesh: NavigationMesh = NavigationMesh.new()
+    navigation_mesh.agent_radius = float(params.get("agent_radius", 0.5))
+    navigation_mesh.agent_height = float(params.get("agent_height", 1.8))
+    navigation_mesh.agent_max_climb = float(params.get("agent_max_climb", 0.25))
+    navigation_mesh.agent_max_slope = float(params.get("agent_max_slope", 45.0))
+    navigation_mesh.cell_size = float(params.get("cell_size", 0.25))
+    navigation_mesh.cell_height = float(params.get("cell_height", 0.25))
+    var kinds: Dictionary = {
+        "meshes": NavigationMesh.PARSED_GEOMETRY_MESH_INSTANCES,
+        "colliders": NavigationMesh.PARSED_GEOMETRY_STATIC_COLLIDERS,
+        "both": NavigationMesh.PARSED_GEOMETRY_BOTH,
+    }
+    navigation_mesh.geometry_parsed_geometry_type = kinds[str(params.get("parsed_geometry", "both"))]
+
+    # The geometry is read from the nodes' global transforms, so a scene has to be in the tree. That is a
+    # second copy of the scene, with its scripts removed so their _ready does not run; the copy that is
+    # saved never enters the tree.
+    var geometry_scene: Node = (load(_res_path(str(params.scene_path))) as PackedScene).instantiate()
+    if not bool(params.get("run_scripts", false)):
+        _strip_scripts(geometry_scene)
+    root.add_child(geometry_scene)
+    var geometry_root: Node = geometry_scene
+    if params.has("geometry_path"):
+        geometry_root = _find_node(geometry_scene, str(geometry_scene.name), str(params.geometry_path))
+    if geometry_root == null:
+        _fail(what + ": geometry node not found: " + str(params.geometry_path))
+        geometry_scene.free()
+        scene_root.free()
+        return
+
+    var source: NavigationMeshSourceGeometryData3D = NavigationMeshSourceGeometryData3D.new()
+    NavigationServer3D.parse_source_geometry_data(navigation_mesh, source, geometry_root)
+    var has_geometry: bool = source.has_data()
+    if has_geometry:
+        NavigationServer3D.bake_from_source_geometry_data(navigation_mesh, source)
+    root.remove_child(geometry_scene)
+    geometry_scene.free()
+    if not has_geometry:
+        _fail(what + ": found no geometry to bake; the scene needs MeshInstance3D nodes or static colliders (see parsedGeometry)")
+        scene_root.free()
+        return
+    var polygons: int = navigation_mesh.get_polygon_count()
+    if polygons == 0:
+        _fail(what + ": the bake made no walkable area; check the floor, the agent size and the cell size")
+        scene_root.free()
+        return
+
+    var region: NavigationRegion3D = NavigationRegion3D.new()
+    region.name = region_name
+    region.navigation_mesh = navigation_mesh
+    parent.add_child(region)
+    region.owner = scene_root
+    if not _save_scene_root(scene_root, str(params.scene_path), what):
+        scene_root.free()
+        return
+    scene_root.free()
+    _result({"node": region_name, "polygons": polygons, "vertices": navigation_mesh.get_vertices().size()})
+
+# Saves the mesh of the first MeshInstance3D of a scene (a .glb, for example) as a Mesh resource, so that a
+# MultiMesh can point to it. mesh_node picks a MeshInstance3D by name.
+func extract_mesh(params: Dictionary) -> void:
+    var what: String = "extract mesh"
+    var source_path: String = _res_path(str(params.source_path))
+    var output_path: String = _res_path(str(params.output_path))
+    var loaded: Resource = load(source_path)
+    if not (loaded is PackedScene):
+        _fail(what + ": " + source_path + " is not a scene or a model that Godot imports as a scene")
+        return
+    var instance: Node = (loaded as PackedScene).instantiate()
+    var candidates: Array = instance.find_children("*", "MeshInstance3D", true, false)
+    if instance is MeshInstance3D:
+        candidates.push_front(instance)
+    if params.has("mesh_node"):
+        candidates = candidates.filter(func(candidate: Node) -> bool: return str(candidate.name) == str(params.mesh_node))
+    if candidates.is_empty():
+        _fail(what + ": " + source_path + " has no MeshInstance3D" + (" named " + str(params.mesh_node) if params.has("mesh_node") else ""))
+        instance.free()
+        return
+    var mesh: Mesh = (candidates[0] as MeshInstance3D).mesh
+    if mesh == null or mesh.get_surface_count() == 0:
+        _fail(what + ": the MeshInstance3D has no mesh data")
+        instance.free()
+        return
+    var vertices: int = 0
+    for surface: int in range(mesh.get_surface_count()):
+        var arrays: Array = mesh.surface_get_arrays(surface)
+        if not arrays.is_empty() and arrays[Mesh.ARRAY_VERTEX] != null:
+            vertices += (arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).size()
+    if vertices == 0:
+        _fail(what + ": Godot could not read the vertices of the mesh")
+        instance.free()
+        return
+    _make_parent_dir(output_path)
+    var save_error: Error = ResourceSaver.save(mesh, output_path)
+    var surfaces: int = mesh.get_surface_count()
+    instance.free()
+    if save_error != OK:
+        _fail(what + ": could not save " + output_path + ", error " + str(save_error))
+        return
+    _result({"output": output_path, "surfaces": surfaces, "vertices": vertices})
