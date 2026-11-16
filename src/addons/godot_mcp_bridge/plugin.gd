@@ -16,6 +16,11 @@ const PORT_FIRST: int = 47800
 const PORT_LAST: int = 47899
 const MAX_LINE_BYTES: int = 1048576
 const MAX_TREE_NODES: int = 500
+const PROBE_DIR: String = "res://.godot/mcp_probe"
+const PROBE_SCRIPT: String = "res://addons/godot_mcp_bridge/mcp_probe.gd"
+const PROBE_WRAPPER: String = "res://.godot/mcp_probe/run.tscn"
+const PROBE_STATUS: String = "res://.godot/mcp_probe/status.json"
+const PROBE_REQUEST: String = "res://.godot/mcp_probe/request.json"
 
 var _server: TCPServer = null
 var _clients: Array[StreamPeerTCP] = []
@@ -23,6 +28,7 @@ var _buffers: Dictionary = {}
 var _token: String = ""
 var _port: int = 0
 var _tree_count: int = 0
+var _handling: bool = false
 
 func _enter_tree() -> void:
     var crypto: Crypto = Crypto.new()
@@ -53,6 +59,15 @@ func _exit_tree() -> void:
     _remove_info()
 
 func _process(_delta: float) -> void:
+    # Saving and playing run the editor's main loop again, which calls this function from
+    # inside a request. Serving clients then would handle the same request again, so skip it.
+    if _handling:
+        return
+    _handling = true
+    _serve_clients()
+    _handling = false
+
+func _serve_clients() -> void:
     if _server == null or not _server.is_listening():
         return
 
@@ -82,11 +97,11 @@ func _process(_delta: float) -> void:
         while newline != -1:
             var line: String = buffered.substr(0, newline).strip_edges()
             buffered = buffered.substr(newline + 1)
+            _buffers[client] = buffered
             if line != "":
                 var answer: Dictionary = _handle_line(line)
                 client.put_data((JSON.stringify(answer) + "\n").to_utf8_buffer())
             newline = buffered.find("\n")
-        _buffers[client] = buffered
 
 func _forget(client: StreamPeerTCP) -> void:
     _clients.erase(client)
@@ -136,6 +151,10 @@ func _run_command(command: String, arguments: Dictionary) -> Dictionary:
         "refresh_filesystem":
             EditorInterface.get_resource_filesystem().scan()
             return _ok({"scanned": true})
+        "probe_status":
+            return _probe_status()
+        "probe_capture":
+            return _probe_capture(arguments)
         _:
             return _error("Unknown command: " + command)
 
@@ -196,10 +215,12 @@ func _set_property(arguments: Dictionary) -> Dictionary:
     var property_name: String = str(arguments.get("property", ""))
     if not _has_property(node, property_name):
         return _error("Node has no property " + property_name)
-    var value_text: String = str(arguments.get("value", ""))
-    var value: Variant = str_to_var(value_text)
-    if value == null and value_text.strip_edges() != "null":
-        return _error("value is not a valid Godot literal: " + value_text)
+    # Same rules as set_node_property in godot_operations.gd: res:// paths load resources, quoted text
+    # is a string, other text is a Godot literal, and the value must read back as it was set.
+    var converted: Dictionary = _convert_value(_property_type(node, property_name), str(arguments.get("value", "")))
+    if not converted.ok:
+        return _error(str(converted.error))
+    var value: Variant = converted.value
 
     var previous: Variant = node.get(property_name)
     var undo_redo: EditorUndoRedoManager = get_undo_redo()
@@ -207,7 +228,13 @@ func _set_property(arguments: Dictionary) -> Dictionary:
     undo_redo.add_do_property(node, property_name, value)
     undo_redo.add_undo_property(node, property_name, previous)
     undo_redo.commit_action()
-    return _ok({"value": var_to_str(node.get(property_name))})
+    var actual: Variant = node.get(property_name)
+    if not _values_match(actual, value):
+        # A value of the wrong type can clear the property, so put back the one it had.
+        var message: String = "The property did not take the value " + var_to_str(value) + " (it is " + var_to_str(actual) + ")"
+        node.set(property_name, previous)
+        return _error(message)
+    return _ok({"value": var_to_str(actual)})
 
 func _add_node(arguments: Dictionary) -> Dictionary:
     var root: Node = EditorInterface.get_edited_scene_root()
@@ -260,11 +287,113 @@ func _play(arguments: Dictionary) -> Dictionary:
             if not _is_project_path(path, ".tscn"):
                 return _error("path must be a res:// .tscn path inside the project")
             EditorInterface.play_custom_scene(path)
+        "probe":
+            return _play_probe(arguments)
         _:
-            return _error("mode must be main, current or custom")
+            return _error("mode must be main, current, custom or probe")
     return _ok({"playing": mode})
 
+# Runs a scene with the probe attached (see mcp_probe.gd). The probe lives in a wrapper scene,
+# so the project itself is not changed. The scene runs as it is on disk, so the editor saves
+# it first when it is the one open.
+func _play_probe(arguments: Dictionary) -> Dictionary:
+    var root: Node = EditorInterface.get_edited_scene_root()
+    var target: String = str(arguments.get("scene", ""))
+    if target == "" and root != null:
+        target = root.scene_file_path
+    if not _is_project_path(target, ".tscn"):
+        return _error("Pass scene as a res:// .tscn path, or open a saved scene in the editor")
+    if not FileAccess.file_exists(target):
+        return _error("Scene not found: " + target)
+    if not FileAccess.file_exists(PROBE_SCRIPT):
+        return _error("The probe script is missing; run install_editor_bridge again")
+    if root != null and root.scene_file_path == target:
+        var saved: Error = EditorInterface.save_scene()
+        if saved != OK:
+            return _error("Could not save the scene before running it: error %d" % saved)
+
+    _remove_probe_file(PROBE_STATUS)
+    _remove_probe_file(PROBE_REQUEST)
+    DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(PROBE_DIR))
+    # Each run has its own session, so a game left running from an earlier run cannot answer for this one.
+    var session: String = "%d-%d" % [Time.get_ticks_usec(), randi()]
+    var wrapper_text: String = "[gd_scene format=3]\n\n[ext_resource type=\"Script\" path=\"%s\" id=\"1\"]\n\n[node name=\"McpProbe\" type=\"Node\"]\nscript = ExtResource(\"1\")\ntarget_scene = %s\nsession = %s\n" % [PROBE_SCRIPT, var_to_str(target), var_to_str(session)]
+    var file: FileAccess = FileAccess.open(PROBE_WRAPPER, FileAccess.WRITE)
+    if file == null:
+        return _error("Could not write " + PROBE_WRAPPER)
+    file.store_string(wrapper_text)
+    file.close()
+    EditorInterface.play_custom_scene(PROBE_WRAPPER)
+    return _ok({"playing": "probe", "target": target, "session": session})
+
+func _probe_status() -> Dictionary:
+    if not FileAccess.file_exists(PROBE_STATUS):
+        return _error("The probe has not reported yet; play with mode probe first")
+    var parsed: Variant = JSON.parse_string(FileAccess.get_file_as_string(PROBE_STATUS))
+    if typeof(parsed) != TYPE_DICTIONARY:
+        return _error("The probe status is being written; ask again")
+    return _ok({"status": parsed})
+
+# Asks the running probe for a screenshot. The answer is in probe_status once capture_id matches.
+func _probe_capture(arguments: Dictionary) -> Dictionary:
+    if not EditorInterface.is_playing_scene():
+        return _error("No scene is playing")
+    var request_id: String = str(arguments.get("id", str(Time.get_ticks_msec())))
+    if not request_id.is_valid_filename():
+        return _error("id must be usable in a file name")
+    var file: FileAccess = FileAccess.open(PROBE_REQUEST, FileAccess.WRITE)
+    if file == null:
+        return _error("Could not write " + PROBE_REQUEST)
+    file.store_string(JSON.stringify({"id": request_id, "capture": true, "session": str(arguments.get("session", ""))}))
+    file.close()
+    return _ok({"requested": request_id})
+
+func _remove_probe_file(path: String) -> void:
+    if FileAccess.file_exists(path):
+        DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
+
 # ---------------------------------------------------------------- helpers
+
+func _property_type(node: Object, property_name: String) -> int:
+    for info: Dictionary in node.get_property_list():
+        if str(info.name) == property_name:
+            return int(info.type)
+    return -1
+
+func _convert_value(expected_type: int, text: String) -> Dictionary:
+    var parsed: Variant = str_to_var(text)
+    var result: Variant = text
+    if parsed != null:
+        if typeof(parsed) == TYPE_STRING:
+            result = parsed
+        elif expected_type != TYPE_STRING:
+            result = parsed
+    elif text.strip_edges() == "null":
+        result = null
+    elif expected_type != TYPE_STRING and not text.begins_with("res://"):
+        return {"ok": false, "value": null, "error": "value is not a valid Godot literal: " + text}
+    if expected_type == TYPE_OBJECT and typeof(result) == TYPE_STRING:
+        var path: String = result
+        if path.begins_with("res://"):
+            result = load(path)
+            if result == null:
+                return {"ok": false, "value": null, "error": "could not load " + path}
+    return {"ok": true, "value": result, "error": ""}
+
+func _values_match(actual: Variant, expected: Variant) -> bool:
+    var expected_kind: int = typeof(expected)
+    var actual_kind: int = typeof(actual)
+    if expected_kind == TYPE_FLOAT or expected_kind == TYPE_INT:
+        return (actual_kind == TYPE_FLOAT or actual_kind == TYPE_INT) and absf(float(actual) - float(expected)) < 0.0001
+    if actual_kind != expected_kind:
+        return false
+    if expected_kind == TYPE_VECTOR2:
+        return (actual as Vector2).is_equal_approx(expected as Vector2)
+    if expected_kind == TYPE_VECTOR3:
+        return (actual as Vector3).is_equal_approx(expected as Vector3)
+    if expected_kind == TYPE_COLOR:
+        return (actual as Color).is_equal_approx(expected as Color)
+    return actual == expected
 
 func _ok(result: Dictionary) -> Dictionary:
     return {"ok": true, "result": result}

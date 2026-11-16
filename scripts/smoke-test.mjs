@@ -33,6 +33,7 @@ const EXPECTED_TOOLS = [
   'install_editor_bridge',
   'editor_status',
   'editor_command',
+  'verify_game',
 ];
 
 const TIMEOUT_MS = 15000;
