@@ -348,6 +348,75 @@ async function main() {
   } finally {
     rmSync(rec, { recursive: true, force: true });
   }
+
+  // Testing tools: bad arguments are rejected before Godot runs, and a Godot that fails is reported.
+  const noScenes = await callTool('smoke_all_scenes', { projectPath: project, include: ['no-such-scene'] });
+  check('smoke_all_scenes reports when no scene matches', noScenes.isError === true && textOf(noScenes).includes('No scene'));
+
+  const badFrames = await callTool('smoke_all_scenes', { projectPath: project, frames: 0 });
+  check('smoke_all_scenes checks frames', badFrames.isError === true && textOf(badFrames).includes('frames'));
+
+  const notSceneFile = await callTool('smoke_all_scenes', { projectPath: project, scenes: ['scripts/none.gd'] });
+  check('smoke_all_scenes checks the scenes list', notSceneFile.isError === true && textOf(notSceneFile).includes('Not a scene'));
+
+  const failedSmoke = await callTool('smoke_all_scenes', { projectPath: project });
+  check('smoke_all_scenes reports a Godot that failed', failedSmoke.isError === true && textOf(failedSmoke).includes('no result'), textOf(failedSmoke).slice(0, 200));
+
+  const noSteps = await callTool('play_scenario', { projectPath: project, scenePath: 'scenes/main.tscn', steps: [] });
+  check('play_scenario needs steps', noSteps.isError === true && textOf(noSteps).includes('steps'));
+
+  const twoActions = await callTool('play_scenario', { projectPath: project, scenePath: 'scenes/main.tscn', steps: [{ wait: 1, frames: 2 }] });
+  check('play_scenario wants one action per step', twoActions.isError === true && textOf(twoActions).includes('exactly one'));
+
+  const badOp = await callTool('play_scenario', { projectPath: project, scenePath: 'scenes/main.tscn', steps: [{ assert: { node: 'Main', property: 'x', op: '~=', value: 1 } }] });
+  check('play_scenario checks the operator', badOp.isError === true && textOf(badOp).includes('op must be'));
+
+  const longWait = await callTool('play_scenario', { projectPath: project, scenePath: 'scenes/main.tscn', steps: Array.from({ length: 10 }, () => ({ wait: 60 })) });
+  check('play_scenario limits the real time', longWait.isError === true && textOf(longWait).includes('300 s'));
+
+  const noMain = await callTool('play_scenario', { projectPath: project, steps: [{ frames: 1 }] });
+  check('play_scenario needs a scene when there is no main scene', noMain.isError === true && textOf(noMain).includes('main scene'));
+
+  const failedScenario = await callTool('play_scenario', { projectPath: project, scenePath: 'scenes/main.tscn', steps: [{ frames: 1 }] });
+  check('play_scenario reports a Godot that failed', failedScenario.isError === true && textOf(failedScenario).includes('no result'), textOf(failedScenario).slice(0, 200));
+
+  const noBaseline = await callTool('visual_regression', { projectPath: project, scenePath: 'scenes/main.tscn' });
+  check('visual_regression asks for a reference first', noBaseline.isError === true && code(noBaseline) === 'BASELINE_MISSING');
+
+  const badName = await callTool('visual_regression', { projectPath: project, scenePath: 'scenes/main.tscn', name: '../x' });
+  check('visual_regression checks the name', badName.isError === true && textOf(badName).includes('name'));
+
+  const badMode = await callTool('visual_regression', { projectPath: project, scenePath: 'scenes/main.tscn', mode: 'overwrite' });
+  check('visual_regression checks the mode', badMode.isError === true && textOf(badMode).includes('mode'));
+
+  const failedUpdate = await callTool('visual_regression', { projectPath: project, scenePath: 'scenes/main.tscn', mode: 'update' });
+  check('visual_regression reports a Godot that failed', failedUpdate.isError === true && !failedUpdate.content.some((c) => c.type === 'image'));
+
+  const badBudget = await callTool('perf_budget', { projectPath: project, scenePath: 'scenes/main.tscn', budget: { maxMagic: 1 } });
+  check('perf_budget rejects an unknown limit', badBudget.isError === true && textOf(badBudget).includes('maxMagic'));
+
+  const negativeBudget = await callTool('perf_budget', { projectPath: project, scenePath: 'scenes/main.tscn', budget: { minFps: -1 } });
+  check('perf_budget checks the limits', negativeBudget.isError === true && textOf(negativeBudget).includes('minFps'));
+
+  const failedPerf = await callTool('perf_budget', { projectPath: project, scenePath: 'scenes/main.tscn' });
+  check('perf_budget reports a Godot that failed', failedPerf.isError === true);
+
+  mkdirSync(join(project, 'scripts'), { recursive: true });
+  writeFileSync(join(project, 'scripts', 'hero.gd'), ['extends Node2D', 'class_name Hero', '', 'signal died', 'signal hurt(amount)', '', 'var hp := 10', '', 'func _ready():', '\tpass', '', 'func take_damage(amount: int) -> void:', '\thp -= amount', '', 'static func create() -> Hero:', '\treturn Hero.new()', ''].join('\n'));
+  const generated = await callTool('generate_tests', { projectPath: project, scriptPath: 'scripts/hero.gd' });
+  const testText = existsSync(join(project, 'test', 'unit', 'test_hero.gd')) ? readFileSync(join(project, 'test', 'unit', 'test_hero.gd'), 'utf8') : '';
+  check('generate_tests writes a test file', generated.isError !== true && testText.startsWith('extends GutTest'), textOf(generated).slice(0, 200));
+  check('generate_tests adds a test for each public function', testText.includes('func test_take_damage()') && testText.includes('func test_create()') && !testText.includes('test__ready'));
+  check('generate_tests checks the signals', testText.includes('assert_has_signal(_sut, "died")') && testText.includes('assert_has_signal(_sut, "hurt")'));
+  check('generate_tests puts nodes in the tree', testText.includes('add_child_autofree(_sut)'));
+  const again = await callTool('generate_tests', { projectPath: project, scriptPath: 'scripts/hero.gd' });
+  check('generate_tests does not overwrite by default', again.isError === true && textOf(again).includes('already exists'));
+  const replaced = await callTool('generate_tests', { projectPath: project, scriptPath: 'scripts/hero.gd', overwrite: true });
+  check('generate_tests overwrites after a checkpoint', replaced.isError !== true && textOf(replaced).includes('checkpoint'));
+  const notGd = await callTool('generate_tests', { projectPath: project, scriptPath: 'scenes/main.tscn' });
+  check('generate_tests only takes .gd files', notGd.isError === true && textOf(notGd).includes('.gd'));
+  const outsideDir = await callTool('generate_tests', { projectPath: project, scriptPath: 'scripts/hero.gd', testDir: '../outside', overwrite: true });
+  check('generate_tests keeps the test folder inside the project', outsideDir.isError === true);
 }
 
 main()

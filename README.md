@@ -249,6 +249,18 @@ None of these needs Godot: they read and write the project's text files.
 | `move_resource` | Moves or renames a file or folder and updates every `res://` reference to it, with its `.import` and `.uid` files. Makes a checkpoint first; `apply: false` only lists what would change |
 | `explain_error` | Explains an error message (what it means, usual causes and fixes, the file and line) and, with `projectPath`, shows the code around the error. For a node that was not found it suggests close node names from the scenes that use the script |
 
+### Testing tools
+
+| Tool | What it does |
+|------|--------------|
+| `smoke_all_scenes` | Opens every scene (or the ones you pick with `scenes`, `include`, `exclude`), runs each for some frames headless, and reports the errors Godot prints while it does, scene by scene: scenes that do not load, script errors in `_ready` and `_process`, missing resources. A scene that hangs is named |
+| `play_scenario` | Plays a scene headless while it follows a list of steps: `wait`, `frames`, `press` (an input action), `key`, `click`, `set`, `call`, `assert` (`==`, `!=`, `<`, `<=`, `>`, `>=`, `approx`, `contains`, `exists`, `visible`), `wait_until` and `assert_no_errors`. Reports each step with the value it saw. `timeScale` shortens long waits |
+| `visual_regression` | Draws a scene and compares it pixel by pixel with a saved picture (`tests/visual`), with a picture of the difference. The first run, or `mode: "update"`, saves the reference. Needs a display and a graphics driver |
+| `perf_budget` | Runs a scene in a window with the frame limit off and measures frame time (average, p95, p99, max), fps, draw calls, nodes and memory, and reports every limit of a `budget` that is exceeded. Needs a display and a graphics driver; numbers depend on the machine |
+| `generate_tests` | Writes a GUT test file for a `.gd` file: it creates the object, checks each signal and adds a pending test per public function with its signature. Does not need Godot. Run it with `run_tests` |
+
+To try them, run `node scripts/fixtures/make-game-fixture.mjs`: a small game with a player that moves with `ui_right`, a score label, a scene whose script fails in `_ready` and a scene that points to a missing file.
+
 ## Building from source
 
 Use this if you want to modify the server or run a local copy:
