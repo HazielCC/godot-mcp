@@ -26,13 +26,24 @@ import {
 
 // Check if debug mode is enabled
 const DEBUG_MODE: boolean = process.env.DEBUG === 'true';
-const GODOT_DEBUG_MODE: boolean = true; // Always use GODOT DEBUG MODE
+// The verbose mode of godot_operations.gd writes test files into the project, waits 500 ms per scene
+// and prints environment variables, so it is opt-in: set GODOT_MCP_DEBUG=true.
+const GODOT_DEBUG_MODE: boolean = process.env.GODOT_MCP_DEBUG === 'true';
 
 const execFileAsync = promisify(execFile);
 
 // Derive __filename and __dirname in ESM
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+
+/** Version from package.json, so the server does not report a number that has drifted. */
+function readPackageVersion(): string {
+  try {
+    return JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version ?? '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
 
 /**
  * Interface representing a running Godot process
@@ -299,6 +310,8 @@ interface GodotProcess {
   archivedScriptErrors: { file: string; line: number; message: string }[];
   // Same for WARNING blocks (GDScript warnings such as shadowed variables).
   archivedScriptWarnings: { file: string; line: number; message: string }[];
+  // The last line of a stream that has not ended yet; a chunk can stop in the middle of a line.
+  partialLine: { output: string; errors: string };
 }
 
 /**
@@ -329,6 +342,7 @@ class GodotServer {
   private checkScriptsPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
+  private godotDebugMode: boolean = GODOT_DEBUG_MODE;
 
   /**
    * Parameter name mappings between snake_case and camelCase
@@ -365,14 +379,13 @@ class GodotServer {
     }
     // Apply configuration if provided
     let debugMode = DEBUG_MODE;
-    let godotDebugMode = GODOT_DEBUG_MODE;
 
     if (config) {
       if (config.debugMode !== undefined) {
         debugMode = config.debugMode;
       }
       if (config.godotDebugMode !== undefined) {
-        godotDebugMode = config.godotDebugMode;
+        this.godotDebugMode = config.godotDebugMode;
       }
       if (config.strictPathValidation !== undefined) {
         this.strictPathValidation = config.strictPathValidation;
@@ -401,7 +414,7 @@ class GodotServer {
     this.server = new Server(
       {
         name: 'godot-mcp',
-        version: '0.1.0',
+        version: readPackageVersion(),
       },
       {
         capabilities: {
@@ -417,10 +430,15 @@ class GodotServer {
     this.server.onerror = (error) => console.error('[MCP Error]', error);
 
     // Cleanup on exit
-    process.on('SIGINT', async () => {
+    // Stop the running game and close when the client ends the session in any way. Without this,
+    // a Godot process started by run_project would be left running after the client closes.
+    const shutdown = async () => {
       await this.cleanup();
       process.exit(0);
-    });
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+    process.stdin.on('end', shutdown);
   }
 
   /**
@@ -475,7 +493,8 @@ class GodotServer {
    */
   private validatePath(path: string): boolean {
     // Basic validation to prevent path traversal
-    if (!path || path.includes('..')) {
+    // Only a ".." path segment climbs out of a folder; a name such as "a..b" is fine.
+    if (!path || path.split(/[\\/]/).includes('..')) {
       return false;
     }
 
@@ -797,26 +816,37 @@ class GodotServer {
       ];
 
       
-      if (GODOT_DEBUG_MODE) {
+      if (this.godotDebugMode) {
         args.push('--debug-godot');
       }
 
       this.logDebug(`Executing: ${this.godotPath} ${args.join(' ')}`);
 
-      const { stdout, stderr } = await execFileAsync(this.godotPath!, args);
+      const { stdout, stderr } = await execFileAsync(this.godotPath!, args, {
+        timeout: 120000,
+        maxBuffer: 64 * 1024 * 1024,
+      });
 
       return { stdout: stdout ?? '', stderr: stderr ?? '' };
-    } catch (error: unknown) {
-      // If execFileAsync throws, it still contains stdout/stderr
-      if (error instanceof Error && 'stdout' in error && 'stderr' in error) {
-        const execError = error as Error & { stdout: string; stderr: string };
-        return {
-          stdout: execError.stdout ?? '',
-          stderr: execError.stderr ?? '',
-        };
+    } catch (error: any) {
+      // A timeout, or an executable that could not be started (ENOENT, EACCES), has no
+      // operation result to report. Returning the empty output would look like a success.
+      if (error?.killed) {
+        throw new Error(`Godot did not finish the operation '${operation}' within 120 seconds`);
+      }
+      if (typeof error?.code !== 'number' && !error?.signal) {
+        throw error;
       }
 
-      throw error;
+      // Godot ran and exited with an error. The handlers look for "Failed to" in stderr,
+      // so make sure a failure without that wording is still reported as one.
+      const stdout: string = error?.stdout ?? '';
+      let stderr: string = error?.stderr ?? '';
+      if (!stderr.includes('Failed to')) {
+        const how = error?.signal ? `signal ${error.signal}` : `exit code ${error.code}`;
+        stderr = `${stderr}\nFailed to run the operation '${operation}' (Godot stopped with ${how}).`.trim();
+      }
+      return { stdout, stderr };
     }
   }
 
@@ -1537,13 +1567,21 @@ class GodotServer {
       }
 
       this.logDebug(`Launching Godot editor for project: ${args.projectPath}`);
+      // stdio is ignored: nobody reads the editor's output, and an unread pipe fills up and
+      // stops the editor once it has written about 64 KB.
       const process = spawn(this.godotPath, ['-e', '--path', args.projectPath], {
-        stdio: 'pipe',
+        stdio: 'ignore',
       });
 
-      process.on('error', (err: Error) => {
-        console.error('Failed to start Godot editor:', err);
+      // Wait for the start, so a wrong GODOT_PATH is reported instead of "launched successfully".
+      await new Promise<void>((resolveStart, rejectStart) => {
+        process.once('error', rejectStart);
+        process.once('spawn', () => resolveStart());
       });
+      process.on('error', (err: Error) => {
+        console.error('Godot editor error:', err);
+      });
+      process.unref();
 
       return {
         content: [
@@ -1605,6 +1643,16 @@ class GodotServer {
     if (session.archivedScriptWarnings.length > MAX_ARCHIVED_SCRIPT_ERRORS) {
       session.archivedScriptWarnings.splice(0, session.archivedScriptWarnings.length - MAX_ARCHIVED_SCRIPT_ERRORS);
     }
+  }
+
+  /**
+   * Split a chunk of process output into whole lines. The text after the last newline is kept
+   * and joined to the next chunk, so a line that arrives in two pieces is not cut in two.
+   */
+  private completeLines(session: GodotProcess, stream: 'output' | 'errors', chunk: string): string[] {
+    const parts = (session.partialLine[stream] + chunk).split('\n');
+    session.partialLine[stream] = parts.pop() ?? '';
+    return parts.map((line) => line.replace(/\r$/, ''));
   }
 
   /**
@@ -1678,10 +1726,11 @@ class GodotServer {
         droppedErrorLines: 0,
         archivedScriptErrors: [],
         archivedScriptWarnings: [],
+        partialLine: { output: '', errors: '' },
       };
 
       process.stdout?.on('data', (data: Buffer) => {
-        const lines = data.toString().split('\n');
+        const lines = this.completeLines(session, 'output', data.toString());
         this.appendBufferedLines(session, 'output', lines);
         lines.forEach((line: string) => {
           if (line.trim()) this.logDebug(`[Godot stdout] ${line}`);
@@ -1689,7 +1738,7 @@ class GodotServer {
       });
 
       process.stderr?.on('data', (data: Buffer) => {
-        const lines = data.toString().split('\n');
+        const lines = this.completeLines(session, 'errors', data.toString());
         this.appendBufferedLines(session, 'errors', lines);
         lines.forEach((line: string) => {
           if (line.trim()) this.logDebug(`[Godot stderr] ${line}`);
@@ -1698,6 +1747,13 @@ class GodotServer {
 
       process.on('exit', (code: number | null) => {
         this.logDebug(`Godot process exited with code ${code}`);
+        // Keep the last line even when it had no newline.
+        for (const stream of ['output', 'errors'] as const) {
+          if (session.partialLine[stream] !== '') {
+            this.appendBufferedLines(session, stream, [session.partialLine[stream]]);
+            session.partialLine[stream] = '';
+          }
+        }
         if (this.activeProcess && this.activeProcess.process === process) {
           this.activeProcess = null;
         }
@@ -4251,8 +4307,7 @@ class GodotServer {
       // Extract project name from project.godot file
       let projectName = basename(args.projectPath);
       try {
-        const fs = require('fs');
-        const projectFileContent = fs.readFileSync(projectFile, 'utf8');
+        const projectFileContent = readFileSync(projectFile, 'utf8');
         const configNameMatch = projectFileContent.match(/config\/name="([^"]+)"/);
         if (configNameMatch && configNameMatch[1]) {
           projectName = configNameMatch[1];
@@ -4884,7 +4939,8 @@ class GodotServer {
         content: [
           {
             type: 'text',
-            text: `UID for ${args.filePath}: ${stdout.trim()}`,
+            // The script prints a JSON line after its log lines; show that line when there is one.
+            text: `UID for ${args.filePath}: ${(stdout.split(/\r?\n/).reverse().find((line) => line.trim().startsWith('{')) ?? stdout).trim()}`,
           },
         ],
       };
@@ -4963,12 +5019,9 @@ class GodotServer {
       }
 
       // Prepare parameters for the operation (already in camelCase)
-      const params = {
-        projectPath: args.projectPath,
-      };
-
-      // Execute the operation
-      const { stdout, stderr } = await this.executeOperation('resave_resources', params, args.projectPath);
+      // No project_path parameter: the script scans res://, which is the project being opened.
+      // An absolute path here would be read as a folder inside the project and find nothing.
+      const { stdout, stderr } = await this.executeOperation('resave_resources', { all: true }, args.projectPath);
 
       if (stderr && stderr.includes('Failed to')) {
         return this.createErrorResponse(
