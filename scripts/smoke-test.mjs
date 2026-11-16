@@ -58,6 +58,11 @@ const EXPECTED_TOOLS = [
   'repair_project',
   'move_resource',
   'explain_error',
+  'smoke_all_scenes',
+  'play_scenario',
+  'visual_regression',
+  'perf_budget',
+  'generate_tests',
 ];
 
 const TIMEOUT_MS = 15000;
