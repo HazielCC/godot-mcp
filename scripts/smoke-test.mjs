@@ -34,6 +34,11 @@ const EXPECTED_TOOLS = [
   'editor_status',
   'editor_command',
   'verify_game',
+  'import_spritesheet',
+  'auto_collision',
+  'build_tilemap',
+  'setup_parallax_2d',
+  'render_scene_2d',
 ];
 
 const TIMEOUT_MS = 15000;

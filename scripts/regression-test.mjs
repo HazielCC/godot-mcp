@@ -91,6 +91,49 @@ async function main() {
 
   const climb = await callTool('read_scene', { projectPath: project, scenePath: '../main.tscn' });
   check('a ".." segment is still rejected', climb.isError === true);
+
+  // 2D tools: bad arguments are rejected before Godot runs.
+  const code = (result) => result.structuredContent?.error?.code;
+  writeFileSync(join(project, 'sheet.png'), 'not really a png');
+
+  const noOutput = await callTool('import_spritesheet', { projectPath: project, texturePath: 'sheet.png' });
+  check('import_spritesheet requires outputPath', noOutput.isError === true && code(noOutput) === 'INVALID_ARGUMENT');
+
+  const noFrame = await callTool('import_spritesheet', { projectPath: project, texturePath: 'sheet.png', outputPath: 'a.tres' });
+  check('import_spritesheet requires a frame size', noFrame.isError === true && textOf(noFrame).includes('frameWidth'));
+
+  const badExt = await callTool('import_spritesheet', { projectPath: project, texturePath: 'sheet.png', outputPath: 'a.res', frameWidth: 8, frameHeight: 8 });
+  check('import_spritesheet requires a .tres output', badExt.isError === true && textOf(badExt).includes('.tres'));
+
+  const outside = await callTool('import_spritesheet', { projectPath: project, texturePath: 'sheet.png', outputPath: '../escape.tres', frameWidth: 8, frameHeight: 8 });
+  check('import_spritesheet keeps the output inside the project', outside.isError === true);
+
+  const okArgs = await callTool('import_spritesheet', { projectPath: project, texturePath: 'sheet.png', outputPath: 'frames/a.tres', frameWidth: 8, frameHeight: 8 });
+  check('import_spritesheet reports a Godot that failed', okArgs.isError === true && !textOf(okArgs).includes('Saved'), textOf(okArgs).slice(0, 200));
+
+  const badKind = await callTool('auto_collision', { projectPath: project, scenePath: 'scenes/main.tscn', nodePath: 'Main/Icon', kind: 'wall' });
+  check('auto_collision rejects an unknown kind', badKind.isError === true && textOf(badKind).includes('kind'));
+
+  const noScene = await callTool('auto_collision', { projectPath: project, scenePath: 'scenes/none.tscn', nodePath: 'Main/Icon' });
+  check('auto_collision reports a missing scene', noScene.isError === true && textOf(noScene).includes('does not exist'));
+
+  const badLegend = await callTool('build_tilemap', { projectPath: project, scenePath: 'scenes/main.tscn', rows: ['#.@'], legend: { '#': { x: 0, y: 0 } } });
+  check('build_tilemap finds a character missing from the legend', badLegend.isError === true && textOf(badLegend).includes('@'));
+
+  const badRows = await callTool('build_tilemap', { projectPath: project, scenePath: 'scenes/main.tscn', rows: [], legend: {} });
+  check('build_tilemap rejects empty rows', badRows.isError === true && textOf(badRows).includes('rows'));
+
+  const emptyLayers = await callTool('setup_parallax_2d', { projectPath: project, scenePath: 'scenes/main.tscn', layers: [] });
+  check('setup_parallax_2d rejects empty layers', emptyLayers.isError === true && textOf(emptyLayers).includes('layers'));
+
+  const missingTexture = await callTool('setup_parallax_2d', { projectPath: project, scenePath: 'scenes/main.tscn', layers: [{ name: 'Sky', texturePath: 'sky.png' }] });
+  check('setup_parallax_2d checks that the texture exists', missingTexture.isError === true && textOf(missingTexture).includes('does not exist'));
+
+  const bigRender = await callTool('render_scene_2d', { projectPath: project, scenePath: 'scenes/main.tscn', width: 99999 });
+  check('render_scene_2d limits the size', bigRender.isError === true && code(bigRender) === 'INVALID_ARGUMENT');
+
+  const failedRender = await callTool('render_scene_2d', { projectPath: project, scenePath: 'scenes/main.tscn' });
+  check('render_scene_2d reports a Godot that failed', failedRender.isError === true && !failedRender.content.some((c) => c.type === 'image'));
 }
 
 main()

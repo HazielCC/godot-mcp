@@ -290,6 +290,11 @@ const PROJECT_PATH_PARAMS: Record<string, string[]> = {
   get_uid: ['filePath'],
   read_scene: ['scenePath'],
   set_node_property: ['scenePath'],
+  import_spritesheet: ['texturePath', 'outputPath', 'scenePath'],
+  auto_collision: ['scenePath'],
+  build_tilemap: ['scenePath', 'texturePath', 'tileSetPath'],
+  setup_parallax_2d: ['scenePath'],
+  render_scene_2d: ['scenePath'],
 };
 
 
@@ -340,6 +345,7 @@ class GodotServer {
   private godotPath: string | null = null;
   private operationsScriptPath: string;
   private checkScriptsPath: string;
+  private renderScenePath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
   private godotDebugMode: boolean = GODOT_DEBUG_MODE;
@@ -408,6 +414,7 @@ class GodotServer {
     // Set the path to the operations script
     this.operationsScriptPath = join(__dirname, 'scripts', 'godot_operations.gd');
     this.checkScriptsPath = join(__dirname, 'scripts', 'check_scripts.gd');
+    this.renderScenePath = join(__dirname, 'scripts', 'render_scene.gd');
     if (debugMode) console.error(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
 
     // Initialize the MCP server
@@ -1448,6 +1455,106 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'import_spritesheet',
+          description: 'Cut a sprite sheet into frames and save a SpriteFrames resource (.tres) with named animations. Optionally add an AnimatedSprite2D that uses it to a scene. Use frameWidth and frameHeight, or columns and rows.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              texturePath: { type: 'string', description: 'Sprite sheet image, relative to the project' },
+              outputPath: { type: 'string', description: 'Where to save the SpriteFrames, relative to the project, ending in .tres' },
+              frameWidth: { type: 'number', description: 'Width of one frame in pixels' },
+              frameHeight: { type: 'number', description: 'Height of one frame in pixels' },
+              columns: { type: 'number', description: 'Number of columns, as an alternative to frameWidth/frameHeight' },
+              rows: { type: 'number', description: 'Number of rows, as an alternative to frameWidth/frameHeight' },
+              animations: {
+                type: 'array',
+                description: 'Animations to create. Each has name, and either row (a whole row of the sheet) or start and count (frame numbers, row by row), plus optional fps (default 10) and loop (default true). Default: one animation "default" with every frame.',
+                items: { type: 'object' },
+              },
+              scenePath: { type: 'string', description: 'Optional scene to add an AnimatedSprite2D to (it must not inherit from another scene)' },
+              parentNodePath: { type: 'string', description: 'Parent for the AnimatedSprite2D, such as "Main" or "Main/Player". Default: the scene root' },
+              nodeName: { type: 'string', description: 'Name of the AnimatedSprite2D. Default: AnimatedSprite2D' },
+            },
+            required: ['projectPath', 'texturePath', 'outputPath'],
+          },
+        },
+        {
+          name: 'auto_collision',
+          description: 'Build collision polygons (CollisionPolygon2D) or light occluders (LightOccluder2D) from the opaque pixels of a Sprite2D, and add them to the scene. The sprite should be a child of a StaticBody2D, Area2D or similar for collisions.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project (it must not inherit from another scene)' },
+              nodePath: { type: 'string', description: 'Path of the Sprite2D, starting with the root name, for example "Player/Sprite2D"' },
+              kind: { type: 'string', enum: ['collision', 'occluder'], description: 'collision (default) or occluder' },
+              epsilon: { type: 'number', description: 'Simplification of the outline in pixels; higher gives fewer points. Default 2' },
+              minArea: { type: 'number', description: 'Ignore shapes smaller than this many square pixels. Default 16' },
+              alphaThreshold: { type: 'number', description: 'Alpha above this counts as solid, 0 to 1. Default 0.1' },
+              targetPath: { type: 'string', description: 'Node that receives the polygons: the sprite itself or its parent (default)' },
+              replace: { type: 'boolean', description: 'Replace polygons made by an earlier call instead of failing. Default false' },
+            },
+            required: ['projectPath', 'scenePath', 'nodePath'],
+          },
+        },
+        {
+          name: 'build_tilemap',
+          description: 'Paint a TileMapLayer from rows of text and add it to a scene. Each character is looked up in the legend to find its cell in the tile atlas; "." and spaces stay empty. Creates the TileSet from a texture when it does not exist. Needs Godot 4.3 or later.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project' },
+              rows: { type: 'array', items: { type: 'string' }, description: 'One string per map row, for example ["####", "#..#", "####"]' },
+              legend: { type: 'object', description: 'Atlas cell of each character, for example {"#": {"x": 0, "y": 0}, "~": [1, 0]}' },
+              texturePath: { type: 'string', description: 'Tile atlas image, used to create the TileSet' },
+              tileSetPath: { type: 'string', description: 'TileSet (.tres) to use, or to create and save when it does not exist' },
+              tileSize: { type: 'number', description: 'Tile size in pixels, for a new TileSet. Default 16' },
+              parentNodePath: { type: 'string', description: 'Parent of the layer. Default: the scene root' },
+              nodeName: { type: 'string', description: 'Name of the layer. Default: TileMapLayer' },
+              originX: { type: 'number', description: 'Cell column of the first character. Default 0' },
+              originY: { type: 'number', description: 'Cell row of the first row. Default 0' },
+            },
+            required: ['projectPath', 'scenePath', 'rows', 'legend'],
+          },
+        },
+        {
+          name: 'setup_parallax_2d',
+          description: 'Add parallax background layers (Parallax2D nodes, each with a Sprite2D) to a scene. Needs Godot 4.3 or later.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project' },
+              layers: {
+                type: 'array',
+                description: 'Layers, back to front. Each has name, texturePath, and optional scrollScale (a number, or {x, y}; default 1), repeat (tile the texture horizontally), repeatTimes (default 3) and zIndex.',
+                items: { type: 'object' },
+              },
+              parentNodePath: { type: 'string', description: 'Parent of the layers. Default: the scene root' },
+            },
+            required: ['projectPath', 'scenePath', 'layers'],
+          },
+        },
+        {
+          name: 'render_scene_2d',
+          description: 'Draw a scene and return it as a PNG image, to check how it looks. It opens a short-lived Godot window, so it needs a display and a graphics driver (it does not work with --headless or on a server without a display).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project' },
+              width: { type: 'number', description: 'Image width in pixels, 64 to 4096. Default 1280' },
+              height: { type: 'number', description: 'Image height in pixels, 64 to 4096. Default 720' },
+              zoom: { type: 'number', description: 'Zoom of the view, for scenes without a Camera2D. Default 1' },
+              centerX: { type: 'number', description: 'World X at the center of the image (needs centerY)' },
+              centerY: { type: 'number', description: 'World Y at the center of the image (needs centerX)' },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
       ],
     }));
 
@@ -1504,6 +1611,16 @@ class GodotServer {
           return await this.handleEditorCommand(request.params.arguments);
         case 'verify_game':
           return await this.handleVerifyGame(request.params.arguments);
+        case 'import_spritesheet':
+          return await this.handleImportSpritesheet(request.params.arguments);
+        case 'auto_collision':
+          return await this.handleAutoCollision(request.params.arguments);
+        case 'build_tilemap':
+          return await this.handleBuildTilemap(request.params.arguments);
+        case 'setup_parallax_2d':
+          return await this.handleSetupParallax2d(request.params.arguments);
+        case 'render_scene_2d':
+          return await this.handleRenderScene2d(request.params.arguments);
         case 'read_scene':
           return await this.handleReadScene(request.params.arguments);
         case 'set_node_property':
@@ -4090,6 +4207,340 @@ class GodotServer {
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
     return undefined;
+  }
+
+  /**
+   * Shared flow of the 2D tools that edit a scene or resource with godot_operations.gd: check the
+   * arguments and the project, run the operation, and report its RESULT line or its failure.
+   * `build` turns the checked arguments into the parameters of the operation.
+   */
+  private async runEditTool(
+    rawArgs: any,
+    spec: {
+      operation: string;
+      label: string;
+      required: string[];
+      build: (args: any) => { params: Record<string, unknown> } | { error: string };
+      summary: (result: any) => string;
+    }
+  ) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    for (const key of ['projectPath', ...spec.required]) {
+      if (typeof args[key] !== 'string' || args[key] === '') {
+        return this.createErrorResponse(`${key} is required and must be text`, [`Provide ${key}`], { code: 'INVALID_ARGUMENT' });
+      }
+    }
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse('Invalid project path', ['Provide a valid path without ".." segments'], { code: 'INVALID_PATH' });
+    }
+    const projectRoot = resolvePath(args.projectPath);
+    if (!existsSync(join(projectRoot, 'project.godot'))) {
+      return this.createErrorResponse(`Not a valid Godot project: ${args.projectPath}`, ['Ensure the path points to a directory containing a project.godot file'], { code: 'PROJECT_NOT_FOUND' });
+    }
+    if (typeof args.scenePath === 'string') {
+      const sceneFile = join(projectRoot, args.scenePath);
+      if (!existsSync(sceneFile)) {
+        return this.createErrorResponse(`Scene file does not exist: ${args.scenePath}`, ['Check the path relative to the project', 'Use create_scene to create it'], { code: 'INVALID_PATH' });
+      }
+      if (this.isInheritedSceneFile(sceneFile)) {
+        return this.createErrorResponse(
+          `${args.scenePath} inherits from another scene, and ${spec.label} would re-pack it and lose the inherited content`,
+          ['Run the tool on the base scene, or add the nodes with add_node and set_node_property'],
+          { code: 'INVALID_ARGUMENT' }
+        );
+      }
+    }
+    for (const key of ['texturePath']) {
+      if (typeof args[key] === 'string' && !existsSync(join(projectRoot, args[key]))) {
+        return this.createErrorResponse(`File does not exist: ${args[key]}`, ['Check the path relative to the project'], { code: 'INVALID_PATH' });
+      }
+    }
+
+    const built = spec.build(args);
+    if ('error' in built) {
+      return this.createErrorResponse(built.error, [`Check the arguments of ${spec.label}`], { code: 'INVALID_ARGUMENT' });
+    }
+
+    try {
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+      }
+      if (!this.godotPath) {
+        return this.createErrorResponse('Could not find a valid Godot executable path', ['Set GODOT_PATH environment variable to specify the correct path'], { code: 'GODOT_NOT_FOUND' });
+      }
+      const { stdout, stderr } = await this.executeOperation(spec.operation, built.params, args.projectPath);
+      const failure = `${stdout}\n${stderr}`.split(/\r?\n/).find((line) => line.includes('Failed to'));
+      if (failure) {
+        return this.createErrorResponse(failure.trim(), ['Check the paths and names with read_scene', 'The project needs Godot 4.3 or later for tiles and parallax']);
+      }
+      const line = stdout.split(/\r?\n/).find((l) => l.startsWith('RESULT '));
+      if (!line) {
+        return this.createErrorResponse(`Godot did not confirm ${spec.label}`, ['Run with GODOT_MCP_DEBUG=true to see the full output']);
+      }
+      const result = JSON.parse(line.slice('RESULT '.length));
+      return {
+        content: [
+          { type: 'text', text: spec.summary(result) },
+          { type: 'text', text: JSON.stringify(result, null, 2) },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to run ${spec.label}: ${error?.message || 'Unknown error'}`, ['Ensure Godot is installed and GODOT_PATH is set correctly']);
+    }
+  }
+
+  /** Handle the import_spritesheet tool */
+  private async handleImportSpritesheet(rawArgs: any) {
+    return this.runEditTool(rawArgs, {
+      operation: 'import_spritesheet',
+      label: 'import_spritesheet',
+      required: ['texturePath', 'outputPath'],
+      build: (args) => {
+        if (!String(args.outputPath).endsWith('.tres')) {
+          return { error: 'outputPath must end in .tres' };
+        }
+        const positive = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value > 0;
+        const bySize = positive(args.frameWidth) && positive(args.frameHeight);
+        const byGrid = positive(args.columns) && positive(args.rows);
+        if (!bySize && !byGrid) {
+          return { error: 'Give frameWidth and frameHeight, or columns and rows, as numbers above 0' };
+        }
+        if (args.animations !== undefined) {
+          if (!Array.isArray(args.animations)) {
+            return { error: 'animations must be a list' };
+          }
+          for (const animation of args.animations) {
+            if (typeof animation !== 'object' || animation === null || typeof animation.name !== 'string' || animation.name === '') {
+              return { error: 'Each animation needs a name' };
+            }
+          }
+        }
+        if (args.scenePath !== undefined && args.nodeName !== undefined && !/^[^"/\\:@.%]+$/.test(String(args.nodeName))) {
+          return { error: 'Invalid nodeName: it cannot contain slashes, quotes, dots, colons, @ or %' };
+        }
+        const params: Record<string, unknown> = { texturePath: args.texturePath, outputPath: args.outputPath };
+        for (const key of ['frameWidth', 'frameHeight', 'columns', 'rows', 'animations', 'scenePath', 'parentNodePath', 'nodeName']) {
+          if (args[key] !== undefined) {
+            params[key] = args[key];
+          }
+        }
+        return { params };
+      },
+      summary: (r) => `Saved ${r.output}: ${r.total_frames} frames of ${r.frame_size[0]}x${r.frame_size[1]} px, ${r.animations.length} animation(s)${r.node ? `; added ${r.node}` : ''}.`,
+    });
+  }
+
+  /** Handle the auto_collision tool */
+  private async handleAutoCollision(rawArgs: any) {
+    return this.runEditTool(rawArgs, {
+      operation: 'auto_collision',
+      label: 'auto_collision',
+      required: ['scenePath', 'nodePath'],
+      build: (args) => {
+        if (args.kind !== undefined && args.kind !== 'collision' && args.kind !== 'occluder') {
+          return { error: 'kind must be collision or occluder' };
+        }
+        for (const key of ['epsilon', 'minArea', 'alphaThreshold']) {
+          if (args[key] !== undefined && (typeof args[key] !== 'number' || !Number.isFinite(args[key]) || args[key] < 0)) {
+            return { error: `${key} must be a number, 0 or more` };
+          }
+        }
+        if (args.alphaThreshold !== undefined && args.alphaThreshold > 1) {
+          return { error: 'alphaThreshold must be between 0 and 1' };
+        }
+        const params: Record<string, unknown> = { scenePath: args.scenePath, nodePath: args.nodePath };
+        for (const key of ['kind', 'epsilon', 'minArea', 'alphaThreshold', 'targetPath', 'replace']) {
+          if (args[key] !== undefined) {
+            params[key] = args[key];
+          }
+        }
+        return { params };
+      },
+      summary: (r) => `Added ${r.polygons} ${r.kind} polygon(s): ${r.nodes.join(', ')}.`,
+    });
+  }
+
+  /** Handle the build_tilemap tool */
+  private async handleBuildTilemap(rawArgs: any) {
+    return this.runEditTool(rawArgs, {
+      operation: 'build_tilemap',
+      label: 'build_tilemap',
+      required: ['scenePath'],
+      build: (args) => {
+        if (!Array.isArray(args.rows) || args.rows.length === 0 || args.rows.length > 512 || !args.rows.every((row: unknown) => typeof row === 'string')) {
+          return { error: 'rows must be a list of 1 to 512 strings' };
+        }
+        if (typeof args.legend !== 'object' || args.legend === null || Array.isArray(args.legend)) {
+          return { error: 'legend must be an object that maps each character to an atlas cell' };
+        }
+        // Sent as a list: the keys of an object would be renamed to snake_case on the way to Godot.
+        const legend: { char: string; x: number; y: number }[] = [];
+        for (const [char, cell] of Object.entries(args.legend as Record<string, any>)) {
+          const x = Array.isArray(cell) ? cell[0] : cell?.x;
+          const y = Array.isArray(cell) ? cell[1] : cell?.y;
+          if ([...char].length !== 1 || !Number.isInteger(x) || !Number.isInteger(y)) {
+            return { error: `legend entry "${char}" must be one character mapped to {"x": n, "y": n} or [x, y] with whole numbers` };
+          }
+          legend.push({ char, x, y });
+        }
+        const used = new Set(args.rows.flatMap((row: string) => [...row]));
+        const missing = [...used].filter((c) => c !== '.' && c !== ' ' && !legend.some((entry) => entry.char === c));
+        if (missing.length > 0) {
+          return { error: `Characters not in the legend: ${missing.join(' ')}` };
+        }
+        if (args.tileSize !== undefined && !(Number.isInteger(args.tileSize) && args.tileSize > 0)) {
+          return { error: 'tileSize must be a whole number above 0' };
+        }
+        if (args.nodeName !== undefined && !/^[^"/\\:@.%]+$/.test(String(args.nodeName))) {
+          return { error: 'Invalid nodeName: it cannot contain slashes, quotes, dots, colons, @ or %' };
+        }
+        const params: Record<string, unknown> = { scenePath: args.scenePath, rows: args.rows, legend };
+        for (const key of ['texturePath', 'tileSetPath', 'tileSize', 'parentNodePath', 'nodeName', 'originX', 'originY']) {
+          if (args[key] !== undefined) {
+            params[key] = args[key];
+          }
+        }
+        return { params };
+      },
+      summary: (r) => `Painted ${r.cells} cells on ${r.node}.`,
+    });
+  }
+
+  /** Handle the setup_parallax_2d tool */
+  private async handleSetupParallax2d(rawArgs: any) {
+    return this.runEditTool(rawArgs, {
+      operation: 'setup_parallax_2d',
+      label: 'setup_parallax_2d',
+      required: ['scenePath'],
+      build: (args) => {
+        if (!Array.isArray(args.layers) || args.layers.length === 0 || args.layers.length > 20) {
+          return { error: 'layers must be a list of 1 to 20 layers' };
+        }
+        const layers: Record<string, unknown>[] = [];
+        for (const layer of args.layers) {
+          const layerName = layer?.name;
+          if (typeof layerName !== 'string' || !/^[^"/\\:@.%]+$/.test(layerName)) {
+            return { error: 'Each layer needs a name without slashes, quotes, dots, colons, @ or %' };
+          }
+          const resolved = this.resolveInsideProject(args.projectPath, layer.texturePath);
+          if ('error' in resolved) {
+            return { error: `Layer ${layerName}: texturePath: ${resolved.error}` };
+          }
+          if (!existsSync(join(resolvePath(args.projectPath), resolved.relPath))) {
+            return { error: `Layer ${layerName}: texture does not exist: ${resolved.relPath}` };
+          }
+          const scale = layer.scrollScale ?? 1;
+          const scrollX = typeof scale === 'number' ? scale : scale?.x;
+          const scrollY = typeof scale === 'number' ? scale : scale?.y;
+          if (!Number.isFinite(scrollX) || !Number.isFinite(scrollY)) {
+            return { error: `Layer ${layerName}: scrollScale must be a number or {x, y}` };
+          }
+          // Snake case on purpose: the keys inside a list are not renamed on the way to Godot.
+          layers.push({
+            name: layerName,
+            texture_path: resolved.relPath,
+            scroll_x: scrollX,
+            scroll_y: scrollY,
+            repeat: layer.repeat === true,
+            repeat_times: Number.isInteger(layer.repeatTimes) && layer.repeatTimes > 0 ? layer.repeatTimes : 3,
+            z_index: Number.isInteger(layer.zIndex) ? layer.zIndex : 0,
+          });
+        }
+        const params: Record<string, unknown> = { scenePath: args.scenePath, layers };
+        if (args.parentNodePath !== undefined) {
+          params.parentNodePath = args.parentNodePath;
+        }
+        return { params };
+      },
+      summary: (r) => `Added ${r.layers.length} parallax layer(s): ${r.layers.join(', ')}.`,
+    });
+  }
+
+  /** Handle the render_scene_2d tool: draw a scene in a short-lived Godot window and return the PNG. */
+  private async handleRenderScene2d(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    if (typeof args.projectPath !== 'string' || !args.projectPath || typeof args.scenePath !== 'string' || !args.scenePath) {
+      return this.createErrorResponse('projectPath and scenePath are required', ['Provide both as text'], { code: 'INVALID_ARGUMENT' });
+    }
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse('Invalid project path', ['Provide a valid path without ".." segments'], { code: 'INVALID_PATH' });
+    }
+    const number = (value: unknown, fallback: number, min: number, max: number): number | undefined => {
+      if (value === undefined) return fallback;
+      return typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max ? value : undefined;
+    };
+    const width = number(args.width, 1280, 64, 4096);
+    const height = number(args.height, 720, 64, 4096);
+    const zoom = number(args.zoom, 1, 0.01, 100);
+    if (width === undefined || height === undefined || zoom === undefined) {
+      return this.createErrorResponse('width and height must be 64 to 4096, and zoom 0.01 to 100', ['Check the numbers'], { code: 'INVALID_ARGUMENT' });
+    }
+    const hasCenter = args.centerX !== undefined || args.centerY !== undefined;
+    if (hasCenter && !(Number.isFinite(args.centerX) && Number.isFinite(args.centerY))) {
+      return this.createErrorResponse('centerX and centerY must both be numbers', ['Give both, or neither'], { code: 'INVALID_ARGUMENT' });
+    }
+
+    const projectRoot = resolvePath(args.projectPath);
+    if (!existsSync(join(projectRoot, 'project.godot'))) {
+      return this.createErrorResponse(`Not a valid Godot project: ${args.projectPath}`, ['Ensure the path points to a directory containing a project.godot file'], { code: 'PROJECT_NOT_FOUND' });
+    }
+    if (!existsSync(join(projectRoot, args.scenePath))) {
+      return this.createErrorResponse(`Scene file does not exist: ${args.scenePath}`, ['Check the path relative to the project'], { code: 'INVALID_PATH' });
+    }
+
+    const tempDir = mkdtempSync(join(tmpdir(), 'godot-mcp-render-'));
+    const outFile = join(tempDir, 'scene.png');
+    try {
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+      }
+      if (!this.godotPath) {
+        return this.createErrorResponse('Could not find a valid Godot executable path', ['Set GODOT_PATH environment variable to specify the correct path'], { code: 'GODOT_NOT_FOUND' });
+      }
+      const scriptArgs = [`res://${args.scenePath}`, outFile, String(zoom)];
+      if (hasCenter) {
+        scriptArgs.push(String(args.centerX), String(args.centerY));
+      }
+      let output = '';
+      try {
+        const { stdout, stderr } = await execFileAsync(
+          this.godotPath,
+          ['--path', projectRoot, '--resolution', `${width}x${height}`, '--script', this.renderScenePath, '--', ...scriptArgs],
+          { timeout: 90000, maxBuffer: 16 * 1024 * 1024 }
+        );
+        output = `${stdout}\n${stderr}`;
+      } catch (error: any) {
+        if (error?.killed) {
+          return this.createErrorResponse('The render did not finish within 90 seconds', ['The scene may be stuck loading, or no display is available'], { code: 'TIMEOUT' });
+        }
+        if (typeof error?.code !== 'number') {
+          throw error;
+        }
+        output = `${error?.stdout ?? ''}\n${error?.stderr ?? ''}`;
+      }
+      if (!existsSync(outFile)) {
+        const reason = output.split(/\r?\n/).find((line) => line.startsWith('RENDER_FAIL')) ?? output.trim().split(/\r?\n/).slice(-3).join('\n');
+        return this.createErrorResponse(
+          `Godot did not render the scene: ${reason || 'no output'}`,
+          ['This tool needs a display and a graphics driver; it cannot run headless or without a display', 'Check the scene with check_project_scripts and verify_game'],
+        );
+      }
+      const scriptErrors = this.groupScriptErrors(this.parseScriptErrors(output));
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({ scene: args.scenePath, width, height, zoom, scriptErrors: scriptErrors.scriptErrors }, null, 2),
+          },
+          { type: 'image', data: readFileSync(outFile).toString('base64'), mimeType: 'image/png' },
+        ],
+        isError: scriptErrors.scriptErrors.length > 0,
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to render the scene: ${error?.message || 'Unknown error'}`, ['Ensure Godot is installed and GODOT_PATH is set correctly']);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   }
 
   /**

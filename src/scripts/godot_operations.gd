@@ -75,6 +75,14 @@ func _init() -> void:
             get_uid(params)
         "resave_resources":
             resave_resources(params)
+        "import_spritesheet":
+            import_spritesheet(params)
+        "auto_collision":
+            auto_collision(params)
+        "build_tilemap":
+            build_tilemap(params)
+        "setup_parallax_2d":
+            setup_parallax_2d(params)
         _:
             log_error("Unknown operation: " + operation)
             quit(1)
@@ -1471,3 +1479,430 @@ func save_scene(params: Dictionary) -> void:
             printerr("Failed to save scene: " + str(save_error))
     else:
         printerr("Failed to pack scene: " + str(result))
+
+
+# ---------------------------------------------------------------------------
+# 2D tools: import_spritesheet, auto_collision, build_tilemap, setup_parallax_2d.
+# Each prints "RESULT <json>" when it succeeds, and "Failed to ..." on stderr otherwise.
+# ---------------------------------------------------------------------------
+
+func _res_path(path: String) -> String:
+    return path if path.begins_with("res://") else "res://" + path
+
+# Reports a failure. quit() does not stop the script, so callers return right after this.
+func _fail(message: String) -> void:
+    printerr("Failed to " + message)
+    quit(1)
+
+func _result(data: Dictionary) -> void:
+    print("RESULT " + JSON.stringify(data))
+
+# Loads and instantiates a scene to edit. Returns null after reporting the failure.
+func _open_scene_root(scene_path: String, what: String) -> Node:
+    var full_path: String = _res_path(scene_path)
+    if not FileAccess.file_exists(full_path):
+        _fail(what + ": scene file does not exist at " + full_path)
+        return null
+    var packed: PackedScene = load(full_path) as PackedScene
+    if packed == null:
+        _fail(what + ": could not load scene " + full_path)
+        return null
+    return packed.instantiate()
+
+func _save_scene_root(scene_root: Node, scene_path: String, what: String) -> bool:
+    var packed: PackedScene = PackedScene.new()
+    var pack_result: Error = packed.pack(scene_root)
+    if pack_result != OK:
+        _fail(what + ": could not pack the scene, error " + str(pack_result))
+        return false
+    var save_error: Error = ResourceSaver.save(packed, _res_path(scene_path))
+    if save_error != OK:
+        _fail(what + ": could not save the scene, error " + str(save_error))
+        return false
+    return true
+
+func _make_parent_dir(res_file: String) -> void:
+    DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(res_file.get_base_dir()))
+
+# Parent node for new nodes: parent_node_path, or the scene root.
+func _resolve_parent(scene_root: Node, params: Dictionary) -> Node:
+    var parent_path: String = str(params.parent_node_path) if params.has("parent_node_path") else str(scene_root.name)
+    return _find_node(scene_root, str(scene_root.name), parent_path)
+
+@warning_ignore("integer_division")
+func import_spritesheet(params: Dictionary) -> void:
+    var what: String = "import spritesheet"
+    var texture_path: String = _res_path(str(params.texture_path))
+    var output_path: String = _res_path(str(params.output_path))
+    var texture: Texture2D = load(texture_path) as Texture2D
+    if texture == null:
+        _fail(what + ": could not load texture " + texture_path)
+        return
+
+    var sheet_size: Vector2i = Vector2i(texture.get_width(), texture.get_height())
+    var cell: Vector2i = Vector2i.ZERO
+    if params.has("frame_width") and params.has("frame_height"):
+        cell = Vector2i(int(params.frame_width), int(params.frame_height))
+    elif params.has("columns") and params.has("rows"):
+        var columns: int = int(params.columns)
+        var rows: int = int(params.rows)
+        if columns > 0 and rows > 0:
+            cell = Vector2i(sheet_size.x / columns, sheet_size.y / rows)
+    if cell.x <= 0 or cell.y <= 0 or cell.x > sheet_size.x or cell.y > sheet_size.y:
+        _fail(what + ": the frame size " + str(cell) + " does not fit the texture " + str(sheet_size))
+        return
+    var grid: Vector2i = Vector2i(sheet_size.x / cell.x, sheet_size.y / cell.y)
+    var total_frames: int = grid.x * grid.y
+
+    var animations: Array = []
+    if params.has("animations") and params.animations is Array and not (params.animations as Array).is_empty():
+        animations = params.animations
+    else:
+        animations = [{"name": "default", "start": 0, "count": total_frames}]
+
+    var frames: SpriteFrames = SpriteFrames.new()
+    if frames.has_animation("default"):
+        frames.remove_animation("default")
+
+    var summary: Array = []
+    for entry: Variant in animations:
+        var animation: Dictionary = entry as Dictionary
+        var anim_name: String = str(animation.get("name", ""))
+        if anim_name == "" or frames.has_animation(anim_name):
+            _fail(what + ": each animation needs its own name; got '" + anim_name + "'")
+            return
+        var start: int = int(animation.get("start", 0))
+        var count: int = int(animation.get("count", grid.x))
+        if animation.has("row"):
+            start = int(animation.row) * grid.x
+        if start < 0 or count <= 0 or start + count > total_frames:
+            _fail(what + ": animation '" + anim_name + "' uses frames " + str(start) + " to " + str(start + count - 1) + ", but the sheet has " + str(total_frames))
+            return
+        frames.add_animation(anim_name)
+        frames.set_animation_speed(anim_name, float(animation.get("fps", 10.0)))
+        frames.set_animation_loop(anim_name, bool(animation.get("loop", true)))
+        for index: int in range(start, start + count):
+            var atlas: AtlasTexture = AtlasTexture.new()
+            atlas.atlas = texture
+            atlas.region = Rect2(Vector2((index % grid.x) * cell.x, (index / grid.x) * cell.y), Vector2(cell))
+            frames.add_frame(anim_name, atlas)
+        summary.append({"name": anim_name, "frames": count})
+
+    _make_parent_dir(output_path)
+    var save_error: Error = ResourceSaver.save(frames, output_path)
+    if save_error != OK:
+        _fail(what + ": could not save " + output_path + ", error " + str(save_error))
+        return
+
+    var node_path: String = ""
+    if params.has("scene_path"):
+        var scene_root: Node = _open_scene_root(str(params.scene_path), what)
+        if scene_root == null:
+            return
+        var parent: Node = _resolve_parent(scene_root, params)
+        if parent == null:
+            _fail(what + ": parent node not found: " + str(params.get("parent_node_path", "")))
+            scene_root.free()
+            return
+        var node_name: String = str(params.get("node_name", "AnimatedSprite2D"))
+        if parent.get_node_or_null(node_name) != null:
+            _fail(what + ": a node named " + node_name + " already exists under the parent")
+            scene_root.free()
+            return
+        var sprite: AnimatedSprite2D = AnimatedSprite2D.new()
+        sprite.name = node_name
+        # Load the saved file so the scene points to it, instead of embedding a copy.
+        sprite.sprite_frames = ResourceLoader.load(output_path, "SpriteFrames", ResourceLoader.CACHE_MODE_REPLACE) as SpriteFrames
+        var first_name: String = str((summary[0] as Dictionary).name)
+        sprite.animation = first_name
+        sprite.autoplay = first_name
+        parent.add_child(sprite)
+        sprite.owner = scene_root
+        if not _save_scene_root(scene_root, str(params.scene_path), what):
+            scene_root.free()
+            return
+        node_path = str(scene_root.name) + "/" + str(scene_root.get_path_to(sprite))
+        scene_root.free()
+
+    _result({"output": output_path, "frame_size": [cell.x, cell.y], "grid": [grid.x, grid.y], "total_frames": total_frames, "animations": summary, "node": node_path})
+
+func _polygon_area(points: PackedVector2Array) -> float:
+    var area: float = 0.0
+    for i: int in range(points.size()):
+        var next: Vector2 = points[(i + 1) % points.size()]
+        area += points[i].x * next.y - next.x * points[i].y
+    return absf(area) / 2.0
+
+# Builds collision or occluder polygons from the opaque part of a Sprite2D's texture.
+@warning_ignore("integer_division")
+func auto_collision(params: Dictionary) -> void:
+    var what: String = "add collision"
+    var scene_root: Node = _open_scene_root(str(params.scene_path), what)
+    if scene_root == null:
+        return
+    var sprite: Sprite2D = _find_node(scene_root, str(scene_root.name), str(params.node_path)) as Sprite2D
+    if sprite == null:
+        _fail(what + ": " + str(params.node_path) + " is not a Sprite2D in the scene")
+        scene_root.free()
+        return
+    if sprite.texture == null:
+        _fail(what + ": the sprite has no texture")
+        scene_root.free()
+        return
+
+    var image: Image = sprite.texture.get_image()
+    if image == null:
+        _fail(what + ": could not read the pixels of the texture")
+        scene_root.free()
+        return
+    if image.is_compressed():
+        image.decompress()
+    image.convert(Image.FORMAT_RGBA8)
+
+    # The part of the texture the sprite shows: its region, and the current frame of a sprite sheet.
+    var rect: Rect2i = Rect2i(Vector2i.ZERO, image.get_size())
+    if sprite.region_enabled:
+        rect = Rect2i(sprite.region_rect).intersection(rect)
+    if sprite.hframes > 1 or sprite.vframes > 1:
+        var cell: Vector2i = Vector2i(rect.size.x / sprite.hframes, rect.size.y / sprite.vframes)
+        rect = Rect2i(rect.position + Vector2i(sprite.frame_coords.x * cell.x, sprite.frame_coords.y * cell.y), cell)
+    if rect.size.x <= 0 or rect.size.y <= 0:
+        _fail(what + ": the visible part of the texture is empty")
+        scene_root.free()
+        return
+
+    var bitmap: BitMap = BitMap.new()
+    bitmap.create_from_image_alpha(image, float(params.get("alpha_threshold", 0.1)))
+    var polygons: Array = bitmap.opaque_to_polygons(rect, float(params.get("epsilon", 2.0)))
+
+    var kind: String = str(params.get("kind", "collision"))
+    var min_area: float = float(params.get("min_area", 16.0))
+    var target: Node = sprite.get_parent() if sprite.get_parent() != null else sprite
+    if params.has("target_path"):
+        target = _find_node(scene_root, str(scene_root.name), str(params.target_path))
+    if target == null or (target != sprite and target != sprite.get_parent()):
+        _fail(what + ": target_path must be the sprite itself or its parent")
+        scene_root.free()
+        return
+    if kind == "collision" and not (target is CollisionObject2D):
+        _fail(what + ": the target must be a CollisionObject2D such as StaticBody2D or Area2D; it is " + target.get_class())
+        scene_root.free()
+        return
+
+    # Points are in texture pixels. Turn them into the sprite's local space, then into the target's.
+    var origin: Vector2 = sprite.offset
+    if sprite.centered:
+        origin -= Vector2(rect.size) / 2.0
+    var to_target: Transform2D = Transform2D.IDENTITY if target == sprite else sprite.transform
+
+    var kept: Array = []
+    for polygon: Variant in polygons:
+        var source: PackedVector2Array = polygon as PackedVector2Array
+        if source.size() < 3:
+            continue
+        var points: PackedVector2Array = PackedVector2Array()
+        for point: Vector2 in source:
+            points.append(to_target * (point - Vector2(rect.position) + origin))
+        if _polygon_area(points) >= min_area:
+            kept.append(points)
+    if kept.is_empty():
+        _fail(what + ": no opaque area of at least " + str(min_area) + " px found; lower min_area or alpha_threshold")
+        scene_root.free()
+        return
+
+    var base_name: String = str(sprite.name) + ("Occluder" if kind == "occluder" else "Collision")
+    var names: Array = []
+    for i: int in range(kept.size()):
+        names.append(base_name if i == 0 else base_name + str(i + 1))
+    for existing_name: String in names:
+        var existing: Node = target.get_node_or_null(existing_name)
+        if existing != null:
+            if bool(params.get("replace", false)):
+                target.remove_child(existing)
+                existing.free()
+            else:
+                _fail(what + ": " + existing_name + " already exists under " + str(target.name) + "; pass replace to overwrite it")
+                scene_root.free()
+                return
+
+    for i: int in range(kept.size()):
+        var created: Node2D = null
+        if kind == "occluder":
+            var occluder: LightOccluder2D = LightOccluder2D.new()
+            var shape: OccluderPolygon2D = OccluderPolygon2D.new()
+            shape.polygon = kept[i]
+            occluder.occluder = shape
+            created = occluder
+        else:
+            var collision: CollisionPolygon2D = CollisionPolygon2D.new()
+            collision.polygon = kept[i]
+            created = collision
+        created.name = names[i]
+        target.add_child(created)
+        created.owner = scene_root
+
+    if not _save_scene_root(scene_root, str(params.scene_path), what):
+        scene_root.free()
+        return
+    scene_root.free()
+    _result({"kind": kind, "polygons": kept.size(), "nodes": names, "texture_rect": [rect.position.x, rect.position.y, rect.size.x, rect.size.y]})
+
+# Paints a TileMapLayer from rows of text. legend is a list of {char, x, y}: the atlas cell of each character.
+func build_tilemap(params: Dictionary) -> void:
+    var what: String = "build tilemap"
+    if not ClassDB.class_exists("TileMapLayer"):
+        _fail(what + ": TileMapLayer needs Godot 4.3 or later")
+        return
+    var scene_root: Node = _open_scene_root(str(params.scene_path), what)
+    if scene_root == null:
+        return
+
+    var parent: Node = _resolve_parent(scene_root, params)
+    if parent == null:
+        _fail(what + ": parent node not found: " + str(params.get("parent_node_path", "")))
+        scene_root.free()
+        return
+    var layer_name: String = str(params.get("node_name", "TileMapLayer"))
+    if parent.get_node_or_null(layer_name) != null:
+        _fail(what + ": a node named " + layer_name + " already exists under the parent")
+        scene_root.free()
+        return
+
+    var cells: Dictionary = {}
+    for entry: Variant in params.legend:
+        var item: Dictionary = entry as Dictionary
+        cells[str(item.get("char", ""))] = Vector2i(int(item.get("x", 0)), int(item.get("y", 0)))
+
+    var tile_size: int = int(params.get("tile_size", 16))
+    var tile_set_path: String = _res_path(str(params.tile_set_path)) if params.has("tile_set_path") else ""
+    var tile_set: TileSet = null
+    var changed: bool = false
+    if tile_set_path != "" and ResourceLoader.exists(tile_set_path):
+        tile_set = ResourceLoader.load(tile_set_path, "TileSet", ResourceLoader.CACHE_MODE_REPLACE) as TileSet
+    if tile_set == null:
+        if not params.has("texture_path"):
+            _fail(what + ": pass texture_path to create a TileSet, or a tile_set_path that exists")
+            scene_root.free()
+            return
+        var texture: Texture2D = load(_res_path(str(params.texture_path))) as Texture2D
+        if texture == null:
+            _fail(what + ": could not load texture " + str(params.texture_path))
+            scene_root.free()
+            return
+        tile_set = TileSet.new()
+        tile_set.tile_size = Vector2i(tile_size, tile_size)
+        var new_source: TileSetAtlasSource = TileSetAtlasSource.new()
+        new_source.texture = texture
+        new_source.texture_region_size = Vector2i(tile_size, tile_size)
+        tile_set.add_source(new_source, 0)
+        changed = true
+    if tile_set.get_source_count() == 0:
+        _fail(what + ": the TileSet has no atlas source")
+        scene_root.free()
+        return
+    var source_id: int = tile_set.get_source_id(0)
+    var source: TileSetAtlasSource = tile_set.get_source(source_id) as TileSetAtlasSource
+    if source == null:
+        _fail(what + ": the first source of the TileSet is not an atlas")
+        scene_root.free()
+        return
+
+    # Every character of the legend needs its tile in the atlas.
+    var grid_size: Vector2i = source.get_atlas_grid_size()
+    for key: Variant in cells:
+        var coords: Vector2i = cells[key]
+        if coords.x < 0 or coords.y < 0 or coords.x >= grid_size.x or coords.y >= grid_size.y:
+            _fail(what + ": '" + str(key) + "' points to atlas cell " + str(coords) + ", but the atlas is " + str(grid_size) + " cells")
+            scene_root.free()
+            return
+        if not source.has_tile(coords):
+            source.create_tile(coords)
+            changed = true
+    if changed and tile_set_path != "":
+        _make_parent_dir(tile_set_path)
+        var tile_set_error: Error = ResourceSaver.save(tile_set, tile_set_path)
+        if tile_set_error != OK:
+            _fail(what + ": could not save " + tile_set_path + ", error " + str(tile_set_error))
+            scene_root.free()
+            return
+        tile_set = ResourceLoader.load(tile_set_path, "TileSet", ResourceLoader.CACHE_MODE_REPLACE) as TileSet
+
+    var layer: TileMapLayer = TileMapLayer.new()
+    layer.name = layer_name
+    layer.tile_set = tile_set
+    var origin: Vector2i = Vector2i(int(params.get("origin_x", 0)), int(params.get("origin_y", 0)))
+    var painted: int = 0
+    var rows: Array = params.rows
+    for y: int in range(rows.size()):
+        var row: String = str(rows[y])
+        for x: int in range(row.length()):
+            var character: String = row[x]
+            if character == "." or character == " ":
+                continue
+            if not cells.has(character):
+                _fail(what + ": the character '" + character + "' (row " + str(y) + ", column " + str(x) + ") is not in the legend")
+                layer.free()
+                scene_root.free()
+                return
+            layer.set_cell(origin + Vector2i(x, y), source_id, cells[character])
+            painted += 1
+
+    parent.add_child(layer)
+    layer.owner = scene_root
+    if not _save_scene_root(scene_root, str(params.scene_path), what):
+        scene_root.free()
+        return
+    scene_root.free()
+    _result({"node": layer_name, "cells": painted, "tile_set": tile_set_path, "source_id": source_id})
+
+# Adds one Parallax2D node per layer, each with a Sprite2D child that shows the layer's texture.
+func setup_parallax_2d(params: Dictionary) -> void:
+    var what: String = "set up parallax"
+    if not ClassDB.class_exists("Parallax2D"):
+        _fail(what + ": Parallax2D needs Godot 4.3 or later")
+        return
+    var scene_root: Node = _open_scene_root(str(params.scene_path), what)
+    if scene_root == null:
+        return
+    var parent: Node = _resolve_parent(scene_root, params)
+    if parent == null:
+        _fail(what + ": parent node not found: " + str(params.get("parent_node_path", "")))
+        scene_root.free()
+        return
+
+    var layers: Array = params.layers
+    var created: Array = []
+    for entry: Variant in layers:
+        var layer: Dictionary = entry as Dictionary
+        var layer_name: String = str(layer.get("name", ""))
+        if layer_name == "" or parent.get_node_or_null(layer_name) != null:
+            _fail(what + ": layer name '" + layer_name + "' is empty or already used under the parent")
+            scene_root.free()
+            return
+        var texture: Texture2D = load(_res_path(str(layer.get("texture_path", "")))) as Texture2D
+        if texture == null:
+            _fail(what + ": could not load texture " + str(layer.get("texture_path", "")))
+            scene_root.free()
+            return
+        var node: Node = ClassDB.instantiate("Parallax2D") as Node
+        node.name = layer_name
+        node.set("scroll_scale", Vector2(float(layer.get("scroll_x", 1.0)), float(layer.get("scroll_y", 1.0))))
+        if bool(layer.get("repeat", false)):
+            node.set("repeat_size", Vector2(texture.get_width(), 0))
+            node.set("repeat_times", int(layer.get("repeat_times", 3)))
+        node.set("z_index", int(layer.get("z_index", 0)))
+        var sprite: Sprite2D = Sprite2D.new()
+        sprite.name = "Sprite2D"
+        sprite.texture = texture
+        sprite.centered = false
+        parent.add_child(node)
+        node.owner = scene_root
+        node.add_child(sprite)
+        sprite.owner = scene_root
+        created.append(layer_name)
+
+    if not _save_scene_root(scene_root, str(params.scene_path), what):
+        scene_root.free()
+        return
+    scene_root.free()
+    _result({"layers": created})
