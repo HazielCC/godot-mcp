@@ -81,12 +81,83 @@ type TestState = { directory: string; savedAt: string; tests: TestRecord[] };
 
 /**
  * Operations that load a scene, change it and save it again with Godot. Godot's headless mode has no
- * rendering server, and a MultiMesh keeps its instance data there, so such a save would erase it.
+ * rendering server, and a MultiMesh keeps its instance data there, so such a save erases it. The data
+ * is read from the file before the operation and written back after it (see preserveMultiMeshData).
  */
 const REPACKING_OPERATIONS = [
   'add_node', 'load_sprite', 'set_node_property', 'save_scene', 'import_spritesheet', 'auto_collision',
   'build_tilemap', 'setup_parallax_2d', 'build_blockout', 'create_pbr_material', 'bake_navmesh',
 ];
+
+/** The buffer line of each MultiMesh in a scene text, by the key of the node that uses it. */
+function readMultiMeshBuffers(text: string): Map<string, string> {
+  const lines = text.split(/\r?\n/);
+  const bufferById = new Map<string, string>();
+  let subId: string | undefined;
+  for (const raw of lines) {
+    const line = raw.trim();
+    const header = /^\[sub_resource\s(.*)\]$/.exec(line);
+    if (header) {
+      const attributes = parseSceneAttributes(header[1]);
+      subId = attributes.type === 'MultiMesh' ? attributes.id : undefined;
+    } else if (line.startsWith('[')) {
+      subId = undefined;
+    } else if (subId !== undefined && line.startsWith('buffer = ')) {
+      bufferById.set(subId, raw);
+    }
+  }
+  const byNode = new Map<string, string>();
+  lines.forEach((raw, index) => {
+    const header = /^\[node\s(.*)\]$/.exec(raw.trim());
+    if (!header) {
+      return;
+    }
+    const attributes = parseSceneAttributes(header[1]);
+    for (let i = index + 1; i < lines.length && !lines[i].trim().startsWith('['); i++) {
+      const use = /^multimesh = SubResource\("([^"]+)"\)/.exec(lines[i].trim());
+      if (use && bufferById.has(use[1])) {
+        byNode.set(sceneNodeKey(attributes.parent, attributes.name ?? ''), bufferById.get(use[1])!);
+      }
+    }
+  });
+  return byNode;
+}
+
+/** Put the buffer lines back into the MultiMesh sub-resources that the nodes use. Returns the new text. */
+function writeMultiMeshBuffers(text: string, buffers: Map<string, string>): string {
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const lines = text.split(/\r?\n/);
+  for (const [key, bufferLine] of buffers) {
+    const section = locateNodeSection(lines, key);
+    if (!section) {
+      continue;
+    }
+    let id: string | undefined;
+    for (let i = section.headerIndex + 1; i < section.end; i++) {
+      id = /^multimesh = SubResource\("([^"]+)"\)/.exec(lines[i].trim())?.[1] ?? id;
+    }
+    const start = lines.findIndex((line) => {
+      const header = /^\[sub_resource\s(.*)\]$/.exec(line.trim());
+      return header !== null && parseSceneAttributes(header[1]).id === id;
+    });
+    if (id === undefined || start === -1) {
+      continue;
+    }
+    let end = start + 1;
+    while (end < lines.length && !lines[end].trim().startsWith('[')) {
+      end++;
+    }
+    const kept = lines.slice(start + 1, end).filter((line) => !line.trim().startsWith('buffer = '));
+    // A blank line before the next section stays after the buffer.
+    let tail = 0;
+    while (kept.length - tail > 0 && kept[kept.length - tail - 1].trim() === '') {
+      tail++;
+    }
+    kept.splice(kept.length - tail, 0, bufferLine);
+    lines.splice(start + 1, end - start - 1, ...kept);
+  }
+  return lines.join(eol);
+}
 
 /** Properties that are stored inside the node's transform (see setPropertyInInheritedScene). */
 const TRANSFORM_PROPERTIES = ['position', 'rotation', 'rotation_degrees', 'scale', 'skew'];
@@ -808,21 +879,69 @@ class GodotServer {
   ): Promise<{ stdout: string; stderr: string }> {
     this.logDebug(`Executing operation: ${operation} in project: ${projectPath}`);
 
-    if (REPACKING_OPERATIONS.includes(operation) && typeof params.scenePath === 'string') {
-      const sceneFile = join(resolvePath(projectPath), params.scenePath);
-      if (existsSync(sceneFile)) {
-        const text = readFileSync(sceneFile, 'utf8');
-        if (text.includes('type="MultiMesh"') && /^buffer = /m.test(text)) {
-          throw new Error(
-            `${params.scenePath} has a MultiMesh with instance data (from scatter_multimesh or the editor). ` +
-            'Godot in headless mode cannot keep that data, so saving the scene would erase it. ' +
-            'Put the MultiMeshInstance3D in its own scene, or make this change in the editor'
-          );
+    const multiMeshFiles = this.snapshotMultiMeshData(operation, params, projectPath);
+    try {
+      return await this.runOperation(operation, params, projectPath);
+    } finally {
+      this.restoreMultiMeshData(multiMeshFiles);
+    }
+  }
+
+  /**
+   * The MultiMesh data of the scene files that an operation is going to re-save. Godot in headless mode
+   * drops that data when it saves a scene, so it is put back afterwards by restoreMultiMeshData.
+   */
+  private snapshotMultiMeshData(
+    operation: string,
+    params: OperationParams,
+    projectPath: string
+  ): { file: string; copyTo?: string; buffers: Map<string, string> }[] {
+    const projectRoot = resolvePath(projectPath);
+    let files: string[] = [];
+    if (operation === 'resave_resources') {
+      files = this.listProjectFiles(projectRoot, projectRoot, ['tscn']).map((file) => join(projectRoot, file));
+    } else if (REPACKING_OPERATIONS.includes(operation) && typeof params.scenePath === 'string') {
+      files = [join(projectRoot, params.scenePath)];
+    }
+    const found: { file: string; copyTo?: string; buffers: Map<string, string> }[] = [];
+    for (const file of files) {
+      if (!existsSync(file)) {
+        continue;
+      }
+      const text = readFileSync(file, 'utf8');
+      if (!text.includes('type="MultiMesh"')) {
+        continue;
+      }
+      const buffers = readMultiMeshBuffers(text);
+      if (buffers.size > 0) {
+        const copyTo = operation === 'save_scene' && typeof params.newPath === 'string' ? join(projectRoot, params.newPath) : undefined;
+        found.push({ file, copyTo, buffers });
+      }
+    }
+    return found;
+  }
+
+  private restoreMultiMeshData(snapshots: { file: string; copyTo?: string; buffers: Map<string, string> }[]): void {
+    for (const { file, copyTo, buffers } of snapshots) {
+      for (const target of [file, copyTo]) {
+        if (target === undefined || !existsSync(target)) {
+          continue;
+        }
+        const text = readFileSync(target, 'utf8');
+        const restored = writeMultiMeshBuffers(text, buffers);
+        if (restored !== text) {
+          writeFileSync(target, restored);
         }
       }
     }
-    this.logDebug(`Original operation params: ${JSON.stringify(params)}`);
+  }
 
+  /** Run one operation of godot_operations.gd (see executeOperation, which also protects MultiMesh data). */
+  private async runOperation(
+    operation: string,
+    params: OperationParams,
+    projectPath: string
+  ): Promise<{ stdout: string; stderr: string }> {
     // Convert camelCase parameters to snake_case for Godot script
     const snakeCaseParams = this.convertCamelToSnakeCase(params);
     this.logDebug(`Converted snake_case params: ${JSON.stringify(snakeCaseParams)}`);
@@ -1623,13 +1742,15 @@ class GodotServer {
         },
         {
           name: 'scatter_multimesh',
-          description: 'Add a MultiMeshInstance3D with many copies of a mesh spread at random over a rectangle (trees, rocks, grass). The result is repeatable: the same seed gives the same layout. The mesh is a Mesh resource or a simple primitive. Because Godot cannot store a MultiMesh in headless mode, this tool writes the scene file itself; other tools that re-save a scene with scattered data refuse to run on it.',
+          description: 'Add a MultiMeshInstance3D with many copies of a mesh spread at random over a rectangle (trees, rocks, grass). The result is repeatable: the same seed gives the same layout. The mesh is a Mesh resource, a model, or a simple primitive. Because Godot cannot store a MultiMesh in headless mode, this tool writes the scene file itself, and the other tools put the data back when they re-save a scene.',
           inputSchema: {
             type: 'object',
             properties: {
               projectPath: { type: 'string', description: 'Path to the Godot project directory' },
               scenePath: { type: 'string', description: 'Scene file, relative to the project' },
-              meshPath: { type: 'string', description: 'Mesh resource to copy: .tres, .res or .obj (a mesh inside a .glb must be saved as .tres first). Without it, primitive is used' },
+              meshPath: { type: 'string', description: 'Mesh to copy: a Mesh resource (.tres, .res, .obj), or a model or scene (.glb, .gltf, .fbx, .tscn) whose first MeshInstance3D is saved as a .res next to it. Without it, primitive is used' },
+              meshNode: { type: 'string', description: 'With a model or scene: name of the MeshInstance3D to copy. Default: the first one' },
+              meshOutputPath: { type: 'string', description: 'With a model or scene: where to save the extracted mesh (.res or .tres). Default: next to the model, ending in _mesh.res' },
               primitive: { type: 'string', enum: ['box', 'sphere', 'cylinder', 'cone'], description: 'Shape when there is no meshPath. Default box' },
               primitiveSize: { type: 'number', description: 'Size of the primitive in meters. Default 1' },
               color: { type: 'string', description: 'Color of the primitive, such as "#4f8a3c"' },
@@ -1652,7 +1773,7 @@ class GodotServer {
         },
         {
           name: 'bake_navmesh',
-          description: 'Bake a navigation mesh from the geometry of a 3D scene (mesh instances and/or static colliders) and add it in a NavigationRegion3D. The scene is loaded into the scene tree to read it, so scripts in it run their _ready.',
+          description: 'Bake a navigation mesh from the geometry of a 3D scene (mesh instances and/or static colliders) and add it in a NavigationRegion3D. Geometry is read from a copy of the scene with its scripts removed (unless runScripts is true).',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1668,6 +1789,7 @@ class GodotServer {
               cellHeight: { type: 'number', description: 'Voxel height. Default 0.25' },
               parentNodePath: { type: 'string', description: 'Parent of the region. Default: the scene root' },
               nodeName: { type: 'string', description: 'Name of the region. Default: NavigationRegion3D' },
+              runScripts: { type: 'boolean', description: 'Keep the scripts of the scene when reading its geometry (for scenes that build their geometry in _ready). Default false' },
             },
             required: ['projectPath', 'scenePath'],
           },
@@ -4828,19 +4950,50 @@ class GodotServer {
     if (args.color !== undefined && !/^#?[0-9a-fA-F]{6}$/.test(String(args.color))) {
       return this.createErrorResponse('color must look like #4f8a3c', ['Check color'], { code: 'INVALID_ARGUMENT' });
     }
+    for (const key of ['meshNode', 'meshOutputPath']) {
+      if (args[key] !== undefined && typeof args[key] !== 'string') {
+        return this.createErrorResponse(`${key} must be text`, [`Check ${key}`], { code: 'INVALID_ARGUMENT' });
+      }
+    }
     const nodeName: string = args.nodeName ?? 'Scatter';
     if (!this.isSafeNodeName(nodeName)) {
       return this.createErrorResponse('Invalid nodeName: it cannot contain slashes, quotes, dots, colons, @ or %', ['Check nodeName'], { code: 'INVALID_ARGUMENT' });
     }
     let meshPath: string | undefined;
     if (args.meshPath !== undefined) {
-      if (!/\.(tres|res|obj)$/i.test(String(args.meshPath))) {
-        return this.createErrorResponse('meshPath must be a Mesh resource: .tres, .res or .obj', ['Save the mesh as a .tres, or leave meshPath out to use a primitive'], { code: 'INVALID_ARGUMENT' });
+      if (!/\.(tres|res|obj|glb|gltf|fbx|tscn|scn)$/i.test(String(args.meshPath))) {
+        return this.createErrorResponse('meshPath must be a Mesh resource (.tres, .res, .obj) or a model or scene (.glb, .gltf, .fbx, .tscn)', ['Check meshPath, or leave it out to use a primitive'], { code: 'INVALID_ARGUMENT' });
       }
       if (!existsSync(join(projectRoot, args.meshPath))) {
         return this.createErrorResponse(`Mesh does not exist: ${args.meshPath}`, ['Check the path relative to the project'], { code: 'INVALID_PATH' });
       }
       meshPath = String(args.meshPath).replace(/\\/g, '/');
+      if (/\.(glb|gltf|fbx|tscn|scn)$/i.test(meshPath)) {
+        // The MultiMesh needs a Mesh resource: save the mesh of the model next to it, and use that.
+        const base = meshPath.replace(/\.[^./]+$/, '');
+        const outputPath: string = args.meshOutputPath ?? `${base}_mesh.res`;
+        const resolvedOutput = this.resolveInsideProject(args.projectPath, outputPath);
+        if ('error' in resolvedOutput || !/\.(res|tres)$/i.test(outputPath)) {
+          return this.createErrorResponse('meshOutputPath must be inside the project and end in .res or .tres', ['Check meshOutputPath'], { code: 'INVALID_PATH' });
+        }
+        try {
+          if (!this.godotPath) {
+            await this.detectGodotPath();
+          }
+          const extracted = await this.executeOperation(
+            'extract_mesh',
+            { sourcePath: meshPath, outputPath: resolvedOutput.relPath, ...(args.meshNode !== undefined ? { meshNode: args.meshNode } : {}) },
+            args.projectPath
+          );
+          const failure = `${extracted.stdout}\n${extracted.stderr}`.split(/\r?\n/).find((line) => line.includes('Failed to'));
+          if (failure) {
+            return this.createErrorResponse(failure.trim(), ['Check meshPath and meshNode', 'The model must be imported (godot --headless --import)']);
+          }
+        } catch (error: any) {
+          return this.createErrorResponse(`Failed to extract the mesh: ${error?.message || 'Unknown error'}`, ['Ensure Godot is installed and GODOT_PATH is set correctly']);
+        }
+        meshPath = resolvedOutput.relPath;
+      }
     }
     if (this.isInheritedSceneFile(sceneFile)) {
       return this.createErrorResponse(`${args.scenePath} inherits from another scene`, ['Run the tool on the base scene'], { code: 'INVALID_ARGUMENT' });
@@ -4998,7 +5151,7 @@ class GodotServer {
           return { error: 'Invalid nodeName: it cannot contain slashes, quotes, dots, colons, @ or %' };
         }
         return {
-          params: this.pickParams(args, ['geometryPath', 'parsedGeometry', 'agentRadius', 'agentHeight', 'agentMaxClimb', 'agentMaxSlope', 'cellSize', 'cellHeight', 'parentNodePath', 'nodeName'], { scenePath: args.scenePath }),
+          params: this.pickParams(args, ['geometryPath', 'parsedGeometry', 'agentRadius', 'agentHeight', 'agentMaxClimb', 'agentMaxSlope', 'cellSize', 'cellHeight', 'parentNodePath', 'nodeName', 'runScripts'], { scenePath: args.scenePath }),
         };
       },
       summary: (r) => `Baked ${r.polygons} polygons (${r.vertices} vertices) in ${r.node}.`,

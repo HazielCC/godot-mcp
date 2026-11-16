@@ -91,6 +91,8 @@ func _init() -> void:
             build_blockout(params)
         "create_pbr_material":
             create_pbr_material(params)
+        "extract_mesh":
+            extract_mesh(params)
         "bake_navmesh":
             # Reading geometry needs the scene inside a running tree, which only exists after _init.
             _deferred_params = params
@@ -2154,6 +2156,11 @@ func create_pbr_material(params: Dictionary) -> void:
     slots.sort()
     _result({"output": output_path, "maps": chosen, "slots": slots, "ignored": ignored, "assigned_to": assigned})
 
+func _strip_scripts(node: Node) -> void:
+    node.set_script(null)
+    for child: Node in node.get_children():
+        _strip_scripts(child)
+
 # Bakes a navigation mesh from the geometry of a scene and adds it in a NavigationRegion3D.
 func bake_navmesh(params: Dictionary) -> void:
     var what: String = "bake navmesh"
@@ -2185,21 +2192,33 @@ func bake_navmesh(params: Dictionary) -> void:
     }
     navigation_mesh.geometry_parsed_geometry_type = kinds[str(params.get("parsed_geometry", "both"))]
 
-    # The geometry is read from the nodes' global transforms, so the scene has to be in the tree.
-    root.add_child(scene_root)
-    var geometry_root: Node = _find_node(scene_root, str(scene_root.name), str(params.geometry_path)) if params.has("geometry_path") else scene_root
+    # The geometry is read from the nodes' global transforms, so a scene has to be in the tree. That is a
+    # second copy of the scene, with its scripts removed so their _ready does not run; the copy that is
+    # saved never enters the tree.
+    var geometry_scene: Node = (load(_res_path(str(params.scene_path))) as PackedScene).instantiate()
+    if not bool(params.get("run_scripts", false)):
+        _strip_scripts(geometry_scene)
+    root.add_child(geometry_scene)
+    var geometry_root: Node = geometry_scene
+    if params.has("geometry_path"):
+        geometry_root = _find_node(geometry_scene, str(geometry_scene.name), str(params.geometry_path))
     if geometry_root == null:
         _fail(what + ": geometry node not found: " + str(params.geometry_path))
+        geometry_scene.free()
         scene_root.free()
         return
 
     var source: NavigationMeshSourceGeometryData3D = NavigationMeshSourceGeometryData3D.new()
     NavigationServer3D.parse_source_geometry_data(navigation_mesh, source, geometry_root)
-    if not source.has_data():
+    var has_geometry: bool = source.has_data()
+    if has_geometry:
+        NavigationServer3D.bake_from_source_geometry_data(navigation_mesh, source)
+    root.remove_child(geometry_scene)
+    geometry_scene.free()
+    if not has_geometry:
         _fail(what + ": found no geometry to bake; the scene needs MeshInstance3D nodes or static colliders (see parsedGeometry)")
         scene_root.free()
         return
-    NavigationServer3D.bake_from_source_geometry_data(navigation_mesh, source)
     var polygons: int = navigation_mesh.get_polygon_count()
     if polygons == 0:
         _fail(what + ": the bake made no walkable area; check the floor, the agent size and the cell size")
@@ -2216,3 +2235,46 @@ func bake_navmesh(params: Dictionary) -> void:
         return
     scene_root.free()
     _result({"node": region_name, "polygons": polygons, "vertices": navigation_mesh.get_vertices().size()})
+
+# Saves the mesh of the first MeshInstance3D of a scene (a .glb, for example) as a Mesh resource, so that a
+# MultiMesh can point to it. mesh_node picks a MeshInstance3D by name.
+func extract_mesh(params: Dictionary) -> void:
+    var what: String = "extract mesh"
+    var source_path: String = _res_path(str(params.source_path))
+    var output_path: String = _res_path(str(params.output_path))
+    var loaded: Resource = load(source_path)
+    if not (loaded is PackedScene):
+        _fail(what + ": " + source_path + " is not a scene or a model that Godot imports as a scene")
+        return
+    var instance: Node = (loaded as PackedScene).instantiate()
+    var candidates: Array = instance.find_children("*", "MeshInstance3D", true, false)
+    if instance is MeshInstance3D:
+        candidates.push_front(instance)
+    if params.has("mesh_node"):
+        candidates = candidates.filter(func(candidate: Node) -> bool: return str(candidate.name) == str(params.mesh_node))
+    if candidates.is_empty():
+        _fail(what + ": " + source_path + " has no MeshInstance3D" + (" named " + str(params.mesh_node) if params.has("mesh_node") else ""))
+        instance.free()
+        return
+    var mesh: Mesh = (candidates[0] as MeshInstance3D).mesh
+    if mesh == null or mesh.get_surface_count() == 0:
+        _fail(what + ": the MeshInstance3D has no mesh data")
+        instance.free()
+        return
+    var vertices: int = 0
+    for surface: int in range(mesh.get_surface_count()):
+        var arrays: Array = mesh.surface_get_arrays(surface)
+        if not arrays.is_empty() and arrays[Mesh.ARRAY_VERTEX] != null:
+            vertices += (arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).size()
+    if vertices == 0:
+        _fail(what + ": Godot could not read the vertices of the mesh")
+        instance.free()
+        return
+    _make_parent_dir(output_path)
+    var save_error: Error = ResourceSaver.save(mesh, output_path)
+    var surfaces: int = mesh.get_surface_count()
+    instance.free()
+    if save_error != OK:
+        _fail(what + ": could not save " + output_path + ", error " + str(save_error))
+        return
+    _result({"output": output_path, "surfaces": surfaces, "vertices": vertices})

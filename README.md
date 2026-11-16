@@ -202,13 +202,13 @@ These need Godot 4.3 or later. Like the 2D tools, they do not edit scenes that i
 |------|--------------|
 | `build_blockout` | Builds a greybox level from rows of text. Each character has a height, elevation, color and collision flag; runs of equal characters become one box (a `StaticBody3D` with a mesh and a `BoxShape3D`) |
 | `create_pbr_material` | Creates a `StandardMaterial3D` from a folder of textures, matching files by name (albedo, normal, roughness, metallic, ao, orm, emission, height). Can assign it to a node. The textures must be imported |
-| `scatter_multimesh` | Spreads copies of a mesh (a `.tres`/`.obj` or a primitive) at random over a rectangle in a `MultiMeshInstance3D`. The same `seed` gives the same layout |
-| `bake_navmesh` | Bakes a navigation mesh from the meshes and static colliders of a scene into a `NavigationRegion3D`. The scene is loaded into the tree, so its scripts run `_ready` |
+| `scatter_multimesh` | Spreads copies of a mesh (a `.tres`/`.obj`, the first mesh of a `.glb`/`.gltf`/`.tscn` saved as a `.res`, or a primitive) at random over a rectangle in a `MultiMeshInstance3D`. The same `seed` gives the same layout |
+| `bake_navmesh` | Bakes a navigation mesh from the meshes and static colliders of a scene into a `NavigationRegion3D`. Geometry is read from a copy of the scene with its scripts removed, so their `_ready` does not run (`runScripts: true` keeps them) |
 | `render_scene_3d` | Draws a scene from `iso`, `front`, `back`, `left`, `right` or `top` and returns one PNG per view. It frames the whole scene and adds a sun and an environment when it has none. It needs a display and a graphics driver; it does not work headless |
 
-**MultiMesh limitation.** Godot in headless mode has no rendering server, so it cannot store a `MultiMesh`'s instances. `scatter_multimesh` therefore writes the scene file itself, and the tools that load and re-save a scene with Godot refuse to run on a scene that has scattered data (they would erase it). Bake the navigation mesh and build the level first, scatter last, or keep the scattered nodes in their own scene. `update_project_uids` re-saves every scene and does not check this.
+**MultiMesh data.** Godot in headless mode has no rendering server, so it cannot store a `MultiMesh`'s instances: `scatter_multimesh` writes the scene file itself, and the other tools (and `update_project_uids`) put the data back after they re-save a scene with Godot, so scattered instances are not lost whatever the order of the tools.
 
-To try them, run `node scripts/fixtures/make-3d-fixture.mjs`. It writes a small project with a brick texture folder and a scene with a floor, and prints its path.
+To try them, run `node scripts/fixtures/make-3d-fixture.mjs`. It writes a small project with a brick texture folder, a crate model and a scene with a floor, and prints its path.
 
 ## Building from source
 
