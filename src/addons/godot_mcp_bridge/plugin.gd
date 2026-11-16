@@ -215,10 +215,12 @@ func _set_property(arguments: Dictionary) -> Dictionary:
     var property_name: String = str(arguments.get("property", ""))
     if not _has_property(node, property_name):
         return _error("Node has no property " + property_name)
-    var value_text: String = str(arguments.get("value", ""))
-    var value: Variant = str_to_var(value_text)
-    if value == null and value_text.strip_edges() != "null":
-        return _error("value is not a valid Godot literal: " + value_text)
+    # Same rules as set_node_property in godot_operations.gd: res:// paths load resources, quoted text
+    # is a string, other text is a Godot literal, and the value must read back as it was set.
+    var converted: Dictionary = _convert_value(_property_type(node, property_name), str(arguments.get("value", "")))
+    if not converted.ok:
+        return _error(str(converted.error))
+    var value: Variant = converted.value
 
     var previous: Variant = node.get(property_name)
     var undo_redo: EditorUndoRedoManager = get_undo_redo()
@@ -226,7 +228,13 @@ func _set_property(arguments: Dictionary) -> Dictionary:
     undo_redo.add_do_property(node, property_name, value)
     undo_redo.add_undo_property(node, property_name, previous)
     undo_redo.commit_action()
-    return _ok({"value": var_to_str(node.get(property_name))})
+    var actual: Variant = node.get(property_name)
+    if not _values_match(actual, value):
+        # A value of the wrong type can clear the property, so put back the one it had.
+        var message: String = "The property did not take the value " + var_to_str(value) + " (it is " + var_to_str(actual) + ")"
+        node.set(property_name, previous)
+        return _error(message)
+    return _ok({"value": var_to_str(actual)})
 
 func _add_node(arguments: Dictionary) -> Dictionary:
     var root: Node = EditorInterface.get_edited_scene_root()
@@ -345,6 +353,47 @@ func _remove_probe_file(path: String) -> void:
         DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
 
 # ---------------------------------------------------------------- helpers
+
+func _property_type(node: Object, property_name: String) -> int:
+    for info: Dictionary in node.get_property_list():
+        if str(info.name) == property_name:
+            return int(info.type)
+    return -1
+
+func _convert_value(expected_type: int, text: String) -> Dictionary:
+    var parsed: Variant = str_to_var(text)
+    var result: Variant = text
+    if parsed != null:
+        if typeof(parsed) == TYPE_STRING:
+            result = parsed
+        elif expected_type != TYPE_STRING:
+            result = parsed
+    elif text.strip_edges() == "null":
+        result = null
+    elif expected_type != TYPE_STRING and not text.begins_with("res://"):
+        return {"ok": false, "value": null, "error": "value is not a valid Godot literal: " + text}
+    if expected_type == TYPE_OBJECT and typeof(result) == TYPE_STRING:
+        var path: String = result
+        if path.begins_with("res://"):
+            result = load(path)
+            if result == null:
+                return {"ok": false, "value": null, "error": "could not load " + path}
+    return {"ok": true, "value": result, "error": ""}
+
+func _values_match(actual: Variant, expected: Variant) -> bool:
+    var expected_kind: int = typeof(expected)
+    var actual_kind: int = typeof(actual)
+    if expected_kind == TYPE_FLOAT or expected_kind == TYPE_INT:
+        return (actual_kind == TYPE_FLOAT or actual_kind == TYPE_INT) and absf(float(actual) - float(expected)) < 0.0001
+    if actual_kind != expected_kind:
+        return false
+    if expected_kind == TYPE_VECTOR2:
+        return (actual as Vector2).is_equal_approx(expected as Vector2)
+    if expected_kind == TYPE_VECTOR3:
+        return (actual as Vector3).is_equal_approx(expected as Vector3)
+    if expected_kind == TYPE_COLOR:
+        return (actual as Color).is_equal_approx(expected as Color)
+    return actual == expected
 
 func _ok(result: Dictionary) -> Dictionary:
     return {"ok": true, "result": result}

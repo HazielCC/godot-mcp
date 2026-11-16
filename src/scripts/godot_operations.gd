@@ -473,8 +473,9 @@ func add_node(params: Dictionary) -> void:
         print("Absolute scene path: " + absolute_scene_path)
 
     if not FileAccess.file_exists(absolute_scene_path):
-        printerr("Scene file does not exist at: " + absolute_scene_path)
+        printerr("Failed to add node: scene file does not exist at: " + absolute_scene_path)
         quit(1)
+        return
 
     var scene: PackedScene = load(full_scene_path)
     if not scene:
@@ -498,8 +499,9 @@ func add_node(params: Dictionary) -> void:
     if parent_path != "root":
         parent = scene_root.get_node(parent_path.replace("root/", ""))
         if not parent:
-            printerr("Parent node not found: " + parent_path)
+            printerr("Failed to add node: parent node not found: " + parent_path)
             quit(1)
+            return
     if debug_mode:
         print("Parent node found: " + parent.name)
 
@@ -519,15 +521,32 @@ func add_node(params: Dictionary) -> void:
         if debug_mode:
             print("Setting properties on node")
         var properties: Dictionary = params.properties
+        var target: Object = new_node
         for property: String in properties:
             if debug_mode:
                 print("Setting property: " + property + " = " + str(properties[property]))
-            var value: Variant = properties[property]
-            if typeof(value) == TYPE_STRING and value.begins_with("res://"):
-                value = load(value)
-                if debug_mode:
-                    print("Loaded resource for property: " + property + " -> " + str(value))
-            new_node.set(property, value)
+            var expected_type: int = property_type_of(target, property)
+            if expected_type == -1:
+                printerr("Failed to add node: " + str(params.node_type) + " has no property " + property)
+                target.free()
+                scene_root.free()
+                quit(1)
+                return
+            var converted: Dictionary = convert_property_value(expected_type, properties[property])
+            if not converted.ok:
+                printerr("Failed to add node: " + property + ": " + str(converted.error))
+                target.free()
+                scene_root.free()
+                quit(1)
+                return
+            var value: Variant = converted.value
+            target.set(property, value)
+            if not values_match(target.get(property), value):
+                printerr("Failed to add node: " + property + " did not take the value " + var_to_str(value))
+                target.free()
+                scene_root.free()
+                quit(1)
+                return
 
     parent.add_child(new_node)
     new_node.owner = scene_root
@@ -1094,6 +1113,74 @@ func resave_resources(params: Dictionary) -> void:
         print("- UIDs successfully generated: " + str(generated_uids))
     print("Resave operation complete")
 
+# Type of a property on a node, or -1 when the node has no such property.
+func property_type_of(node: Object, property_name: String) -> int:
+    for info: Dictionary in node.get_property_list():
+        if str(info.name) == property_name:
+            return int(info.type)
+    return -1
+
+# Turns the value given for a property into the value that property takes. A string for a
+# Resource property is a res:// path, and text for a String property stays as text. Any other
+# text is a Godot literal, parsed with str_to_var(). Returns {ok, value, error}.
+func convert_property_value(expected_type: int, value: Variant) -> Dictionary:
+    if typeof(value) == TYPE_DICTIONARY:
+        return convert_json_object(expected_type, value)
+    if typeof(value) != TYPE_STRING:
+        return {"ok": true, "value": value, "error": ""}
+    var text: String = value
+    var parsed: Variant = str_to_var(text)
+    var result: Variant = text
+    if parsed != null:
+        # A quoted text such as "res://a.tres" parses to a string; other literals parse to their value.
+        if typeof(parsed) == TYPE_STRING:
+            result = parsed
+        elif expected_type != TYPE_STRING:
+            result = parsed
+    elif text.strip_edges() == "null":
+        result = null
+    elif expected_type != TYPE_STRING and not text.begins_with("res://"):
+        return {"ok": false, "value": null, "error": "value is not a valid Godot literal: " + text}
+    if expected_type == TYPE_OBJECT and typeof(result) == TYPE_STRING:
+        var path: String = result
+        if path.begins_with("res://"):
+            result = load(path)
+            if result == null:
+                return {"ok": false, "value": null, "error": "could not load " + path}
+    return {"ok": true, "value": result, "error": ""}
+
+# A JSON object such as {"x": 10, "y": 20} sets a Vector2, Vector3 or Color property, and a
+# JSON object sets a Dictionary property as it is.
+func convert_json_object(expected_type: int, value: Variant) -> Dictionary:
+    var fields: Dictionary = value
+    if expected_type == TYPE_VECTOR2 and fields.has("x") and fields.has("y"):
+        return {"ok": true, "value": Vector2(float(fields.x), float(fields.y)), "error": ""}
+    if expected_type == TYPE_VECTOR3 and fields.has("x") and fields.has("y") and fields.has("z"):
+        return {"ok": true, "value": Vector3(float(fields.x), float(fields.y), float(fields.z)), "error": ""}
+    if expected_type == TYPE_COLOR and fields.has("r") and fields.has("g") and fields.has("b"):
+        return {"ok": true, "value": Color(float(fields.r), float(fields.g), float(fields.b), float(fields.get("a", 1.0))), "error": ""}
+    if expected_type == TYPE_DICTIONARY:
+        return {"ok": true, "value": fields, "error": ""}
+    return {"ok": false, "value": null, "error": "a JSON object only sets a Vector2, Vector3, Color or Dictionary property"}
+
+# True when a property reports the value that was set. Numbers and vectors are compared with a small
+# tolerance, because Godot stores rotations and scales as matrices and reads them back with rounding.
+# Values of different types never match, so the comparison never mixes them.
+func values_match(actual: Variant, expected: Variant) -> bool:
+    var expected_kind: int = typeof(expected)
+    var actual_kind: int = typeof(actual)
+    if expected_kind == TYPE_FLOAT or expected_kind == TYPE_INT:
+        return (actual_kind == TYPE_FLOAT or actual_kind == TYPE_INT) and absf(float(actual) - float(expected)) < 0.0001
+    if actual_kind != expected_kind:
+        return false
+    if expected_kind == TYPE_VECTOR2:
+        return (actual as Vector2).is_equal_approx(expected as Vector2)
+    if expected_kind == TYPE_VECTOR3:
+        return (actual as Vector3).is_equal_approx(expected as Vector3)
+    if expected_kind == TYPE_COLOR:
+        return (actual as Color).is_equal_approx(expected as Color)
+    return actual == expected
+
 # Set one property on a node of an existing scene. The value is a Godot literal,
 # such as 42, true, "text", or Vector2(1, 2), parsed with str_to_var().
 # node_path is written like "root/Player"; its first segment is the scene root.
@@ -1143,15 +1230,21 @@ func set_node_property(params: Dictionary) -> void:
         quit(1)
         return
 
-    var value_text: String = params.value
-    var value: Variant = str_to_var(value_text)
-    if value == null and value_text.strip_edges() != "null":
-        printerr("Failed to set property: value is not a valid Godot literal: " + value_text)
+    var converted: Dictionary = convert_property_value(property_type_of(node, property_name), str(params.value))
+    if not converted.ok:
+        printerr("Failed to set property: " + str(converted.error))
         scene_root.free()
         quit(1)
         return
 
+    var value: Variant = converted.value
     node.set(property_name, value)
+    var actual: Variant = node.get(property_name)
+    if not values_match(actual, value):
+        printerr("Failed to set property: " + property_name + " did not take the value " + var_to_str(value) + " (it is " + var_to_str(actual) + ")")
+        scene_root.free()
+        quit(1)
+        return
 
     var packed_scene: PackedScene = PackedScene.new()
     var pack_result: Error = packed_scene.pack(scene_root)

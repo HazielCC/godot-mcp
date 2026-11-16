@@ -4447,8 +4447,9 @@ class GodotServer {
       const { stdout, stderr } = await this.executeOperation('add_node', params, args.projectPath);
 
       if (stderr && stderr.includes('Failed to')) {
+        // The operation script already words its failures as "Failed to add node: ...".
         return this.createErrorResponse(
-          `Failed to add node: ${stderr}`,
+          stderr.includes('Failed to add node') ? stderr : `Failed to add node: ${stderr}`,
           [
             'Check if the node type is valid',
             'Ensure the parent node path exists',
