@@ -9,11 +9,17 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize, resolve as resolvePath, relative, isAbsolute } from 'path';
-import { existsSync, readdirSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, cpSync } from 'fs';
+import { copyFileSync, existsSync, readdirSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, cpSync } from 'fs';
 import net from 'net';
 import { tmpdir } from 'os';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
+
+import {
+  createCheckpoint, deleteCheckpoint, diffCheckpoint, explainError, findCheckpoint, listCheckpoints, moveResource,
+  repairProject, restoreCheckpoint, validateProject,
+} from './recovery.js';
+import { buildGutTest, globToRegExp, parseScript } from './testing.js';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -68,6 +74,7 @@ type ToolErrorCode =
   | 'EDITOR_TIMEOUT'
   | 'EDITOR_REFUSED'
   | 'PROBE_NOT_READY'
+  | 'BASELINE_MISSING'
   | 'OPERATION_FAILED';
 
 /** Codes where repeating the same call later may succeed without changing its arguments. */
@@ -389,6 +396,11 @@ const PROJECT_PATH_PARAMS: Record<string, string[]> = {
   create_particles: ['scenePath', 'texturePath'],
   tune_particles: ['scenePath', 'texturePath'],
   render_particles: ['scenePath'],
+  move_resource: ['from', 'to'],
+  play_scenario: ['scenePath'],
+  visual_regression: ['scenePath'],
+  perf_budget: ['scenePath'],
+  generate_tests: ['scriptPath', 'testDir'],
 };
 
 
@@ -444,6 +456,10 @@ class GodotServer {
   private renderSceneUiPath: string;
   private inspectUiPath: string;
   private renderParticlesPath: string;
+  private smokeScenesPath: string;
+  private playScenarioPath: string;
+  private profileScenePath: string;
+  private imageDiffPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
   private godotDebugMode: boolean = GODOT_DEBUG_MODE;
@@ -517,6 +533,10 @@ class GodotServer {
     this.renderSceneUiPath = join(__dirname, 'scripts', 'render_scene_ui.gd');
     this.inspectUiPath = join(__dirname, 'scripts', 'inspect_ui.gd');
     this.renderParticlesPath = join(__dirname, 'scripts', 'render_particles.gd');
+    this.smokeScenesPath = join(__dirname, 'scripts', 'smoke_scenes.gd');
+    this.playScenarioPath = join(__dirname, 'scripts', 'play_scenario.gd');
+    this.profileScenePath = join(__dirname, 'scripts', 'profile_scene.gd');
+    this.imageDiffPath = join(__dirname, 'scripts', 'image_diff.gd');
     if (debugMode) console.error(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
 
     // Initialize the MCP server
@@ -2002,6 +2022,161 @@ class GodotServer {
             required: ['projectPath', 'scenePath'],
           },
         },
+        {
+          name: 'checkpoint',
+          description: 'Save and restore the state of the project files (scenes, resources, scripts, shaders, project.godot) so a change can be undone. Checkpoints live in .godot/mcp_checkpoints (the newest 20 are kept). Restoring first makes a checkpoint of the current state, so a restore can be undone too. repair_project and move_resource make their own checkpoint before they change anything. Does not need Godot.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              action: { type: 'string', enum: ['create', 'list', 'diff', 'restore', 'delete'], description: 'create saves the files; list shows the checkpoints; diff shows what changed since one; restore puts its files back; delete removes one' },
+              id: { type: 'string', description: 'For diff, restore and delete: a checkpoint id from list, or "latest"' },
+              label: { type: 'string', description: 'For create: a note, such as "before the new level"' },
+              paths: { type: 'array', items: { type: 'string' }, description: 'For create: files or folders to cover, relative to the project. Default: the whole project except addons' },
+              deleteNew: { type: 'boolean', description: 'For restore: also delete the files created since the checkpoint. Default false' },
+            },
+            required: ['projectPath', 'action'],
+          },
+        },
+        {
+          name: 'validate_project',
+          description: 'Check the project files for broken references without running Godot: ext_resource files that do not exist (and where they moved), ids that are not declared, nodes whose parent is missing, duplicate node names, signal connections to nodes or methods that do not exist, autoloads, the main scene and plugins that point to missing files, and preload/load paths in scripts. Every problem has the file, line and a suggestion.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              includeAddons: { type: 'boolean', description: 'Also check the addons folder. Default false' },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'repair_project',
+          description: 'Fix the broken file paths that validate_project can resolve: a file that moved is found by its uid or by being the only file with that name, and the path is updated in scenes, resources, scripts and project.godot. By default it only reports what it would change; pass apply to make the changes, after a checkpoint. Does not need Godot.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              apply: { type: 'boolean', description: 'Make the changes. Default false (only report)' },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'move_resource',
+          description: 'Move or rename a file or folder of the project and update every res:// reference to it in scenes, resources, scripts, shaders, project.godot and settings, together with its .import and .uid files. Makes a checkpoint first. The imported copy is rebuilt the next time the project is imported. Does not need Godot.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              from: { type: 'string', description: 'File or folder to move, relative to the project' },
+              to: { type: 'string', description: 'New path, relative to the project; it must not exist' },
+              apply: { type: 'boolean', description: 'Do the move. Default true; pass false to only list what would change' },
+            },
+            required: ['projectPath', 'from', 'to'],
+          },
+        },
+        {
+          name: 'explain_error',
+          description: 'Explain an error message from Godot or from get_debug_output: what kind of error it is, the usual causes and fixes, the file and line, and the code around that line when a project is given. For a node that was not found it also suggests close node names from the scenes that use the script. Does not need Godot.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              message: { type: 'string', description: 'The error text, including the "at: ... (res://file.gd:12)" lines when there are any' },
+              projectPath: { type: 'string', description: 'Optional project, to show the code around the error' },
+            },
+            required: ['message'],
+          },
+        },
+        {
+          name: 'smoke_all_scenes',
+          description: 'Open every scene of the project (or the ones you choose), let each run for some frames, and report the errors Godot prints while it does, scene by scene: scenes that do not load, script errors in _ready and _process, missing resources. Runs headless in one Godot process. A scene that hangs is named. Use it after a big change to find what broke.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              frames: { type: 'number', description: 'Frames to run each scene, 1 to 600. Default 10' },
+              scenes: { type: 'array', items: { type: 'string' }, description: 'Scenes to check, relative to the project. Default: every scene except addons' },
+              include: { type: 'array', items: { type: 'string' }, description: 'Only scenes whose path matches one of these patterns (* is a wildcard; a pattern without * matches anywhere in the path)' },
+              exclude: { type: 'array', items: { type: 'string' }, description: 'Skip scenes that match one of these patterns' },
+              includeAddons: { type: 'boolean', description: 'Also check scenes inside addons. Default false' },
+              failOnWarnings: { type: 'boolean', description: 'Count warnings as failures. Default false' },
+              importFirst: { type: 'boolean', description: 'Run godot --import first, for a project that was never opened. Default false' },
+              timeoutMs: { type: 'number', description: 'Limit for the whole run, 10000 to 3600000. Default 300000' },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'play_scenario',
+          description: 'Play a scene while it follows a scenario, headless, and check what happens. Steps: wait (seconds of game time), frames, press (an input action), key, click [x, y], set (a property), call (a method), assert (a property of a node with ==, !=, <, <=, >, >=, approx, contains, exists, visible), wait_until (an assert that is retried until it holds or times out) and assert_no_errors. Reports each step with the value it saw. Stops at the first failure unless continueOnFail is set.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene to play, relative to the project. Default: the main scene' },
+              steps: {
+                type: 'array',
+                description: 'Steps, 1 to 200. Each is an object with one action, and an optional "name". Examples: {"press": "ui_accept"}, {"wait": 1.5}, {"set": {"node": "Main/Player", "property": "position", "value": "Vector2(10, 0)"}}, {"assert": {"node": "Main/Player", "property": "position:x", "op": ">", "value": 5}}, {"wait_until": {"node": "Main/Hud/Score", "property": "text", "op": "==", "value": "10", "timeout": 5}}, {"call": {"node": "Main/Player", "method": "jump", "args": []}}, {"click": [120, 80]}, {"key": "Space"}, {"assert_no_errors": true}. Node paths start with the root name.',
+                items: { type: 'object' },
+              },
+              timeScale: { type: 'number', description: 'Speed of game time, 0.1 to 20, so long waits take less real time. Default 1' },
+              continueOnFail: { type: 'boolean', description: 'Keep going after a failed step. Default false' },
+              timeoutMs: { type: 'number', description: 'Limit in real time, 10000 to 600000. Default 120000' },
+            },
+            required: ['projectPath', 'steps'],
+          },
+        },
+        {
+          name: 'visual_regression',
+          description: 'Compare how a scene looks now with a saved picture, pixel by pixel. The first time (or with mode update) it saves the picture in tests/visual; later it draws the scene again and reports how many pixels differ, with a picture of the difference. The scene must draw itself (a UI scene, a 2D scene, or a 3D scene with a camera). It opens a short-lived Godot window, so it needs a display and a graphics driver.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project' },
+              mode: { type: 'string', enum: ['compare', 'update'], description: 'compare (default) checks against the saved picture; update saves a new one' },
+              name: { type: 'string', description: 'Name of the picture. Default: the scene file name' },
+              width: { type: 'number', description: 'Width in pixels, 64 to 2048. Default 1280' },
+              height: { type: 'number', description: 'Height in pixels, 64 to 2048. Default 720' },
+              pixelTolerance: { type: 'number', description: 'Largest change of a color channel (0 to 1) that still counts as equal. Default 0.02' },
+              maxDifferentPercent: { type: 'number', description: 'Percent of pixels allowed to differ, 0 to 100. Default 0.1' },
+              baselineDir: { type: 'string', description: 'Folder of the saved pictures, relative to the project. Default tests/visual' },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'perf_budget',
+          description: 'Run a scene in a window for a few seconds with the frame limit off and measure frame time (average, p95, p99, max), frames per second, draw calls, nodes, objects and memory. With a budget it reports every limit that is exceeded. It opens a short-lived Godot window, so it needs a display and a graphics driver; the numbers depend on the machine, so compare them with a budget set on the same machine.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project' },
+              seconds: { type: 'number', description: 'Seconds to measure, 1 to 60. Default 3' },
+              warmup: { type: 'number', description: 'Seconds to run before measuring, 0 to 10. Default 1' },
+              width: { type: 'number', description: 'Viewport width, 64 to 4096. Default 1280' },
+              height: { type: 'number', description: 'Viewport height, 64 to 4096. Default 720' },
+              budget: { type: 'object', description: 'Limits: maxFrameMsP95, minFps, maxDrawCalls, maxNodes, maxMemoryMb, maxVideoMemoryMb' },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'generate_tests',
+          description: 'Write a GUT test file for a GDScript file: it creates the object, checks that it can be created, checks that each signal exists, and adds a pending test for every public function, with the function signature, ready to fill in. Does not need Godot. Run the result with run_tests.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scriptPath: { type: 'string', description: 'The .gd file to test, relative to the project' },
+              testDir: { type: 'string', description: 'Folder for the test file, relative to the project. Default test/unit' },
+              overwrite: { type: 'boolean', description: 'Replace the test file if it exists (a checkpoint is made first). Default false' },
+            },
+            required: ['projectPath', 'scriptPath'],
+          },
+        },
       ],
     }));
 
@@ -2096,6 +2271,26 @@ class GodotServer {
           return await this.handleTuneParticles(request.params.arguments);
         case 'render_particles':
           return await this.handleRenderParticles(request.params.arguments);
+        case 'checkpoint':
+          return await this.handleCheckpoint(request.params.arguments);
+        case 'validate_project':
+          return await this.handleValidateProject(request.params.arguments);
+        case 'repair_project':
+          return await this.handleRepairProject(request.params.arguments);
+        case 'move_resource':
+          return await this.handleMoveResource(request.params.arguments);
+        case 'explain_error':
+          return await this.handleExplainError(request.params.arguments);
+        case 'smoke_all_scenes':
+          return await this.handleSmokeAllScenes(request.params.arguments);
+        case 'play_scenario':
+          return await this.handlePlayScenario(request.params.arguments);
+        case 'visual_regression':
+          return await this.handleVisualRegression(request.params.arguments);
+        case 'perf_budget':
+          return await this.handlePerfBudget(request.params.arguments);
+        case 'generate_tests':
+          return await this.handleGenerateTests(request.params.arguments);
         case 'read_scene':
           return await this.handleReadScene(request.params.arguments);
         case 'set_node_property':
@@ -5917,6 +6112,643 @@ class GodotServer {
       };
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  /** Check projectPath for the tools that work on files only. Returns the resolved project folder, or an error response. */
+  private checkProjectFolder(args: any): { projectRoot: string } | { error: any } {
+    if (typeof args?.projectPath !== 'string' || !args.projectPath) {
+      return { error: this.createErrorResponse('Project path is required', ['Provide a valid path to a Godot project directory'], { code: 'INVALID_ARGUMENT' }) };
+    }
+    if (!this.validatePath(args.projectPath)) {
+      return { error: this.createErrorResponse('Invalid project path', ['Provide a valid path without ".." segments'], { code: 'INVALID_PATH' }) };
+    }
+    const projectRoot = resolvePath(args.projectPath);
+    if (!existsSync(join(projectRoot, 'project.godot'))) {
+      return { error: this.createErrorResponse(`Not a valid Godot project: ${args.projectPath}`, ['Ensure the path points to a directory containing a project.godot file'], { code: 'PROJECT_NOT_FOUND' }) };
+    }
+    return { projectRoot };
+  }
+
+  private textResult(summary: string, details: unknown, isError = false) {
+    return {
+      content: [
+        { type: 'text', text: summary },
+        { type: 'text', text: JSON.stringify(details, null, 2) },
+      ],
+      isError,
+    };
+  }
+
+  /** Handle the checkpoint tool */
+  private async handleCheckpoint(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    const target = this.checkProjectFolder(args);
+    if ('error' in target) {
+      return target.error;
+    }
+    const root = target.projectRoot;
+    const action = args.action;
+    if (!['create', 'list', 'diff', 'restore', 'delete'].includes(action)) {
+      return this.createErrorResponse('action must be create, list, diff, restore or delete', ['Check action'], { code: 'INVALID_ARGUMENT' });
+    }
+    try {
+      if (action === 'create') {
+        if (args.label !== undefined && (typeof args.label !== 'string' || args.label.length > 200)) {
+          return this.createErrorResponse('label must be text of up to 200 characters', ['Check label'], { code: 'INVALID_ARGUMENT' });
+        }
+        let paths: string[] | undefined;
+        if (args.paths !== undefined) {
+          if (!Array.isArray(args.paths) || args.paths.length > 100 || !args.paths.every((p: unknown) => typeof p === 'string')) {
+            return this.createErrorResponse('paths must be a list of up to 100 paths', ['Check paths'], { code: 'INVALID_ARGUMENT' });
+          }
+          paths = [];
+          for (const value of args.paths as string[]) {
+            const resolved = this.resolveInsideProject(args.projectPath, value);
+            if ('error' in resolved) {
+              return this.createErrorResponse(`paths: ${resolved.error}`, ['Use paths inside the project'], { code: 'INVALID_PATH' });
+            }
+            paths.push(resolved.relPath);
+          }
+        }
+        const manifest = createCheckpoint(root, { label: args.label, paths });
+        return this.textResult(`Checkpoint ${manifest.id} saved: ${manifest.files.length} files${manifest.label ? ` (${manifest.label})` : ''}.`, { id: manifest.id, label: manifest.label, files: manifest.files.length });
+      }
+      if (action === 'list') {
+        const all = listCheckpoints(root);
+        const summary = all.length === 0 ? 'There are no checkpoints.' : all.map((c) => `${c.id}  ${c.files.length} files  ${c.label}`).join('\n');
+        return this.textResult(summary, { checkpoints: all.map((c) => ({ id: c.id, label: c.label, createdAt: c.createdAt, files: c.files.length })) });
+      }
+      if (typeof args.id !== 'string' || args.id === '') {
+        return this.createErrorResponse('id is required (a checkpoint id from list, or "latest")', ['Use action list to see the ids'], { code: 'INVALID_ARGUMENT' });
+      }
+      if (action === 'delete') {
+        return deleteCheckpoint(root, args.id)
+          ? this.textResult(`Checkpoint ${args.id} deleted.`, { deleted: args.id })
+          : this.createErrorResponse(`Checkpoint not found: ${args.id}`, ['Use action list to see the ids'], { code: 'INVALID_ARGUMENT' });
+      }
+      const manifest = findCheckpoint(root, args.id);
+      if (!manifest) {
+        return this.createErrorResponse(`Checkpoint not found: ${args.id}`, ['Use action list to see the ids'], { code: 'INVALID_ARGUMENT' });
+      }
+      if (action === 'diff') {
+        const difference = diffCheckpoint(root, manifest);
+        return this.textResult(
+          `Since ${manifest.id}: ${difference.changed.length} changed, ${difference.removed.length} removed, ${difference.added.length} new, ${difference.unchanged} unchanged.`,
+          difference
+        );
+      }
+      const result = restoreCheckpoint(root, manifest, { deleteNew: args.deleteNew === true });
+      return this.textResult(
+        `Restored ${result.restored.length} file(s) from ${manifest.id}${result.removed.length > 0 ? ` and deleted ${result.removed.length} new file(s)` : ''}. To undo this, restore ${result.undoCheckpoint}.`,
+        result
+      );
+    } catch (error: any) {
+      return this.createErrorResponse(`Checkpoint failed: ${error?.message || 'Unknown error'}`, ['Check that the project folder is writable']);
+    }
+  }
+
+  /** Handle the validate_project tool */
+  private async handleValidateProject(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    const target = this.checkProjectFolder(args);
+    if ('error' in target) {
+      return target.error;
+    }
+    try {
+      const result = validateProject(target.projectRoot, { includeAddons: args.includeAddons === true });
+      const shown = result.issues.filter((i) => i.severity !== 'info').slice(0, 15).map((i) => `- [${i.severity}] ${i.file}${i.line ? `:${i.line}` : ''}: ${i.message}${i.suggestion ? `. ${i.suggestion}` : ''}`);
+      const summary = [`Checked ${result.filesChecked} files: ${result.counts.error} error(s), ${result.counts.warning} warning(s), ${result.counts.info} info.`, ...shown].join('\n');
+      return this.textResult(summary, { counts: result.counts, filesChecked: result.filesChecked, issues: result.issues.slice(0, 300), issuesOmitted: Math.max(0, result.issues.length - 300) }, result.counts.error > 0);
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to check the project: ${error?.message || 'Unknown error'}`, ['Check that the project folder is readable']);
+    }
+  }
+
+  /** Handle the repair_project tool */
+  private async handleRepairProject(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    const target = this.checkProjectFolder(args);
+    if ('error' in target) {
+      return target.error;
+    }
+    if (args.apply !== undefined && typeof args.apply !== 'boolean') {
+      return this.createErrorResponse('apply must be true or false', ['Check apply'], { code: 'INVALID_ARGUMENT' });
+    }
+    try {
+      const apply = args.apply === true;
+      const result = repairProject(target.projectRoot, { apply });
+      const lines = result.changes.map((c) => `- ${c.file}: ${c.from} -> ${c.to}${c.occurrences > 1 ? ` (x${c.occurrences})` : ''}`);
+      const summary = [
+        result.changes.length === 0 ? 'No path can be repaired automatically.' : `${apply ? 'Changed' : 'Would change'} ${result.changes.length} path(s):`,
+        ...lines,
+        ...(result.unresolved.length > 0 ? ['', `${result.unresolved.length} missing file(s) could not be resolved (use validate_project for the list).`] : []),
+        ...(result.checkpoint ? ['', `Checkpoint ${result.checkpoint} was made first; restore it to undo.`] : []),
+        ...(!apply && result.changes.length > 0 ? ['', 'Run again with apply set to true to make the changes.'] : []),
+      ].join('\n');
+      return this.textResult(summary, { applied: apply, ...result, unresolved: result.unresolved.slice(0, 100) });
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to repair the project: ${error?.message || 'Unknown error'}`, ['Check that the project folder is writable']);
+    }
+  }
+
+  /** Handle the move_resource tool */
+  private async handleMoveResource(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    const target = this.checkProjectFolder(args);
+    if ('error' in target) {
+      return target.error;
+    }
+    for (const key of ['from', 'to']) {
+      if (typeof args[key] !== 'string' || args[key] === '') {
+        return this.createErrorResponse(`${key} is required and must be text`, [`Provide ${key}`], { code: 'INVALID_ARGUMENT' });
+      }
+    }
+    if (args.apply !== undefined && typeof args.apply !== 'boolean') {
+      return this.createErrorResponse('apply must be true or false', ['Check apply'], { code: 'INVALID_ARGUMENT' });
+    }
+    try {
+      const apply = args.apply !== false;
+      const result = moveResource(target.projectRoot, args.from, args.to, { apply });
+      const total = result.updates.reduce((sum, u) => sum + u.occurrences, 0);
+      const summary = [
+        `${apply ? 'Moved' : 'Would move'} ${args.from} to ${args.to}${result.moved.length > 1 ? ` (with ${result.moved.slice(1).join(', ')})` : ''}.`,
+        `${apply ? 'Updated' : 'Would update'} ${total} reference(s) in ${result.updates.length} file(s).`,
+        ...(result.checkpoint ? [`Checkpoint ${result.checkpoint} was made first; restore it to undo.`] : []),
+      ].join('\n');
+      return this.textResult(summary, { applied: apply, ...result });
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to move: ${error?.message || 'Unknown error'}`, ['Check that both paths are inside the project and that the target does not exist']);
+    }
+  }
+
+  /** Handle the explain_error tool */
+  private async handleExplainError(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    if (typeof args.message !== 'string' || args.message.trim() === '' || args.message.length > 20000) {
+      return this.createErrorResponse('message is required: the error text, up to 20000 characters', ['Paste the error from get_debug_output or the Godot console'], { code: 'INVALID_ARGUMENT' });
+    }
+    let projectRoot: string | undefined;
+    if (args.projectPath !== undefined) {
+      const target = this.checkProjectFolder(args);
+      if ('error' in target) {
+        return target.error;
+      }
+      projectRoot = target.projectRoot;
+    }
+    const explanation = explainError(args.message, projectRoot);
+    const where = explanation.locations.length > 0 ? ` at ${explanation.locations[0].file}:${explanation.locations[0].line}` : '';
+    const context = explanation.context ? ['', ...explanation.context.lines.map((l) => `${l.here ? '>' : ' '} ${String(l.number).padStart(4)} | ${l.text}`)] : [];
+    const summary = [
+      `${explanation.title}${where}`,
+      explanation.explanation,
+      '',
+      'What to try:',
+      ...explanation.fixes.map((f) => `- ${f}`),
+      ...(explanation.hints.length > 0 ? ['', ...explanation.hints] : []),
+      ...context,
+    ].join('\n');
+    return this.textResult(summary, explanation);
+  }
+
+  /** Run a headless Godot script of this server and return its output, or an error response for a start failure. */
+  private async runHeadlessScript(script: string, projectRoot: string, scriptArgs: string[], timeoutMs: number): Promise<{ output: string; timedOut: boolean } | { error: any }> {
+    try {
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+      }
+      if (!this.godotPath) {
+        return { error: this.createErrorResponse('Could not find a valid Godot executable path', ['Set GODOT_PATH environment variable to specify the correct path'], { code: 'GODOT_NOT_FOUND' }) };
+      }
+      const { stdout, stderr } = await execFileAsync(
+        this.godotPath,
+        ['--headless', '--path', projectRoot, '--script', script, '--', ...scriptArgs],
+        { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 }
+      );
+      return { output: `${stdout}\n${stderr}`, timedOut: false };
+    } catch (error: any) {
+      if (error?.killed) {
+        return { output: `${error?.stdout ?? ''}\n${error?.stderr ?? ''}`, timedOut: true };
+      }
+      if (typeof error?.code !== 'number') {
+        return { error: this.createErrorResponse(`Failed to run Godot: ${error?.message || 'Unknown error'}`, ['Ensure Godot is installed and GODOT_PATH is set correctly']) };
+      }
+      return { output: `${error?.stdout ?? ''}\n${error?.stderr ?? ''}`, timedOut: false };
+    }
+  }
+
+  private readJsonFile(file: string): any | undefined {
+    try {
+      return existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Handle the smoke_all_scenes tool */
+  private async handleSmokeAllScenes(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    const target = this.checkProjectFolder(args);
+    if ('error' in target) {
+      return target.error;
+    }
+    const projectRoot = target.projectRoot;
+    const problem = this.checkNumbers(args, { frames: [1, 600], timeoutMs: [10000, 3600000] });
+    if (problem) {
+      return this.createErrorResponse(problem, ['Check the numbers'], { code: 'INVALID_ARGUMENT' });
+    }
+    for (const key of ['scenes', 'include', 'exclude']) {
+      if (args[key] !== undefined && !(Array.isArray(args[key]) && args[key].length <= 300 && args[key].every((v: unknown) => typeof v === 'string' && v !== ''))) {
+        return this.createErrorResponse(`${key} must be a list of up to 300 texts`, [`Check ${key}`], { code: 'INVALID_ARGUMENT' });
+      }
+    }
+    for (const key of ['includeAddons', 'failOnWarnings', 'importFirst']) {
+      if (args[key] !== undefined && typeof args[key] !== 'boolean') {
+        return this.createErrorResponse(`${key} must be true or false`, [`Check ${key}`], { code: 'INVALID_ARGUMENT' });
+      }
+    }
+
+    let scenes: string[];
+    if (args.scenes !== undefined) {
+      scenes = [];
+      for (const value of args.scenes as string[]) {
+        const resolved = this.resolveInsideProject(args.projectPath, value);
+        if ('error' in resolved || !resolved.relPath.endsWith('.tscn') || !existsSync(join(projectRoot, resolved.relPath))) {
+          return this.createErrorResponse(`Not a scene of the project: ${value}`, ['Give .tscn paths relative to the project'], { code: 'INVALID_PATH' });
+        }
+        scenes.push(resolved.relPath);
+      }
+    } else {
+      scenes = this.listProjectFiles(projectRoot, projectRoot, ['tscn']).filter((file) => args.includeAddons === true || !file.startsWith('addons/'));
+    }
+    const includes = ((args.include ?? []) as string[]).map(globToRegExp);
+    const excludes = ((args.exclude ?? []) as string[]).map(globToRegExp);
+    scenes = scenes.filter((file) => (includes.length === 0 || includes.some((r) => r.test(file))) && !excludes.some((r) => r.test(file))).sort();
+    if (scenes.length === 0) {
+      return this.createErrorResponse('No scene to check', ['Check include, exclude and scenes'], { code: 'INVALID_ARGUMENT' });
+    }
+    if (scenes.length > 300) {
+      return this.createErrorResponse(`${scenes.length} scenes is too many for one run (limit 300)`, ['Narrow it down with include or exclude'], { code: 'INVALID_ARGUMENT' });
+    }
+
+    const tempDir = mkdtempSync(join(tmpdir(), 'godot-mcp-smoke-'));
+    try {
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+      }
+      if (this.godotPath && args.importFirst === true) {
+        const importOutput = await this.runGodotImport(projectRoot);
+        if (importOutput !== undefined) {
+          return this.createErrorResponse(`Godot import failed:\n${importOutput.slice(0, 1500)}`, ['Open the project in the Godot editor to see the import errors'], { code: 'IMPORT_FAILED' });
+        }
+      }
+      const listFile = join(tempDir, 'scenes.json');
+      const outFile = join(tempDir, 'result.json');
+      writeFileSync(listFile, JSON.stringify(scenes.map((file) => `res://${file}`)));
+      const timeoutMs: number = args.timeoutMs ?? 300000;
+      const ran = await this.runHeadlessScript(this.smokeScenesPath, projectRoot, [listFile, outFile, String(args.frames ?? 10)], timeoutMs);
+      if ('error' in ran) {
+        return ran.error;
+      }
+      const data = this.readJsonFile(outFile);
+      if (!data) {
+        const reason = ran.output.split(/\r?\n/).find((line) => line.startsWith('SMOKE_FAIL')) ?? ran.output.trim().split(/\r?\n/).slice(-3).join('\n');
+        return this.createErrorResponse(`The run produced no result: ${reason || 'no output'}`, ['Check the project with diagnose_project and check_project_scripts'], ran.timedOut ? { code: 'TIMEOUT' } : {});
+      }
+      const results: any[] = data.scenes;
+      const stuck = ran.timedOut ? (existsSync(`${outFile}.current`) ? readFileSync(`${outFile}.current`, 'utf8').trim() : undefined) : undefined;
+      const failing = results.filter((r) => !r.ok || (args.failOnWarnings === true && r.warnings > 0));
+      const lines = [
+        `${results.length} of ${scenes.length} scene(s) run for ${args.frames ?? 10} frames: ${results.length - failing.length} ok, ${failing.length} failing.`,
+        ...(ran.timedOut ? [`The run stopped after ${Math.round(timeoutMs / 1000)} s${stuck ? ` while it was running ${stuck}` : ''}. The scenes after it were not checked.`] : []),
+        ...failing.slice(0, 15).flatMap((r) => [
+          `- ${r.scene}${r.load_error ? `: ${r.load_error}` : `: ${r.error_count} error(s)${r.warnings > 0 ? `, ${r.warnings} warning(s)` : ''}`}`,
+          ...(r.errors as any[]).slice(0, 3).map((e) => `    ${e.file ? `${e.file}:${e.line} ` : ''}${String(e.message).split('\n')[0].slice(0, 160)}`),
+        ]),
+      ];
+      return this.textResult(lines.join('\n'), { frames: args.frames ?? 10, checked: results.length, total: scenes.length, timedOut: ran.timedOut, stuckScene: stuck, scenes: results }, failing.length > 0 || ran.timedOut);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  /** The main scene of a project, from project.godot (res:// path), or undefined. */
+  private mainSceneOf(projectRoot: string): string | undefined {
+    const text = readFileSync(join(projectRoot, 'project.godot'), 'utf8');
+    return /^run\/main_scene="([^"]+)"/m.exec(text)?.[1];
+  }
+
+  /** Handle the play_scenario tool */
+  private async handlePlayScenario(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    const target = this.checkProjectFolder(args);
+    if ('error' in target) {
+      return target.error;
+    }
+    const projectRoot = target.projectRoot;
+    const problem = this.checkNumbers(args, { timeScale: [0.1, 20], timeoutMs: [10000, 600000] });
+    if (problem) {
+      return this.createErrorResponse(problem, ['Check the numbers'], { code: 'INVALID_ARGUMENT' });
+    }
+    let scene: string | undefined;
+    if (args.scenePath !== undefined) {
+      if (typeof args.scenePath !== 'string' || !existsSync(join(projectRoot, args.scenePath))) {
+        return this.createErrorResponse(`Scene file does not exist: ${String(args.scenePath)}`, ['Check the path relative to the project'], { code: 'INVALID_PATH' });
+      }
+      scene = `res://${args.scenePath}`;
+    } else {
+      scene = this.mainSceneOf(projectRoot);
+      if (!scene) {
+        return this.createErrorResponse('The project has no main scene, and scenePath was not given', ['Pass scenePath'], { code: 'INVALID_ARGUMENT' });
+      }
+    }
+    if (!Array.isArray(args.steps) || args.steps.length < 1 || args.steps.length > 200) {
+      return this.createErrorResponse('steps must be a list of 1 to 200 steps', ['Check steps'], { code: 'INVALID_ARGUMENT' });
+    }
+    const actions = ['wait', 'frames', 'press', 'key', 'click', 'set', 'call', 'assert', 'wait_until', 'assert_no_errors'];
+    const ops = ['==', '!=', '<', '<=', '>', '>=', 'approx', 'contains', 'exists', 'visible'];
+    let gameSeconds = 0;
+    for (const [index, step] of (args.steps as any[]).entries()) {
+      const where = `step ${index + 1}`;
+      if (typeof step !== 'object' || step === null || Array.isArray(step)) {
+        return this.createErrorResponse(`${where} must be an object`, ['Check steps'], { code: 'INVALID_ARGUMENT' });
+      }
+      const present = actions.filter((a) => step[a] !== undefined);
+      if (present.length !== 1) {
+        return this.createErrorResponse(`${where} needs exactly one of: ${actions.join(', ')}`, ['Check steps'], { code: 'INVALID_ARGUMENT' });
+      }
+      const action = present[0];
+      const value = step[action];
+      const bad = (message: string) => this.createErrorResponse(`${where}: ${message}`, ['Check steps'], { code: 'INVALID_ARGUMENT' });
+      if (step.name !== undefined && (typeof step.name !== 'string' || step.name.length > 80)) {
+        return bad('name must be text of up to 80 characters');
+      }
+      if (action === 'wait') {
+        if (typeof value !== 'number' || !(value >= 0 && value <= 60)) return bad('wait must be a number of seconds from 0 to 60');
+        gameSeconds += value;
+      } else if (action === 'frames') {
+        if (!Number.isInteger(value) || value < 1 || value > 3600) return bad('frames must be a whole number from 1 to 3600');
+      } else if (action === 'press' || action === 'key') {
+        if (typeof value !== 'string' || value === '') return bad(`${action} must be text`);
+        if (step.hold !== undefined && !(typeof step.hold === 'number' && step.hold >= 0 && step.hold <= 5)) return bad('hold must be a number from 0 to 5');
+        gameSeconds += step.hold ?? 0.1;
+      } else if (action === 'click') {
+        if (!(Array.isArray(value) && value.length === 2 && value.every((n: unknown) => typeof n === 'number' && Number.isFinite(n)))) return bad('click must be [x, y]');
+        if (step.button !== undefined && step.button !== 'left' && step.button !== 'right') return bad('button must be left or right');
+      } else if (action === 'assert_no_errors') {
+        if (value !== true) return bad('assert_no_errors must be true');
+      } else {
+        if (typeof value !== 'object' || value === null || Array.isArray(value) || typeof value.node !== 'string' || value.node === '') return bad(`${action} needs an object with a node`);
+        if (action === 'set' && (typeof value.property !== 'string' || value.property === '' || value.value === undefined)) return bad('set needs property and value');
+        if (action === 'call') {
+          if (typeof value.method !== 'string' || !/^\w+$/.test(value.method)) return bad('call needs a method name');
+          if (value.args !== undefined && !(Array.isArray(value.args) && value.args.length <= 10)) return bad('call args must be a list of up to 10 values');
+        }
+        if (action === 'assert' || action === 'wait_until') {
+          const op = value.op ?? '==';
+          if (!ops.includes(op)) return bad(`op must be one of: ${ops.join(' ')}`);
+          if (!['exists', 'visible'].includes(op) && (typeof value.property !== 'string' || value.property === '' || value.value === undefined)) return bad(`${action} needs property and value`);
+          if (action === 'wait_until') {
+            if (value.timeout !== undefined && !(typeof value.timeout === 'number' && value.timeout > 0 && value.timeout <= 60)) return bad('timeout must be a number from 0 to 60');
+            gameSeconds += value.timeout ?? 5;
+          }
+        }
+      }
+    }
+    const timeScale: number = args.timeScale ?? 1;
+    if (gameSeconds / timeScale > 300) {
+      return this.createErrorResponse('The scenario could take over 300 s of real time', ['Shorten the waits, or raise timeScale'], { code: 'INVALID_ARGUMENT' });
+    }
+
+    const tempDir = mkdtempSync(join(tmpdir(), 'godot-mcp-scenario-'));
+    try {
+      const scenarioFile = join(tempDir, 'scenario.json');
+      const outFile = join(tempDir, 'result.json');
+      writeFileSync(scenarioFile, JSON.stringify({ scene, time_scale: timeScale, continue_on_fail: args.continueOnFail === true, steps: args.steps }));
+      const timeoutMs: number = args.timeoutMs ?? 120000;
+      const ran = await this.runHeadlessScript(this.playScenarioPath, projectRoot, [scenarioFile, outFile], timeoutMs);
+      if ('error' in ran) {
+        return ran.error;
+      }
+      if (ran.timedOut) {
+        return this.createErrorResponse(`The scenario did not finish within ${Math.round(timeoutMs / 1000)} seconds`, ['A step may be waiting for something that never happens; use wait_until with a timeout', 'Raise timeScale to shorten the waits'], { code: 'TIMEOUT' });
+      }
+      const data = this.readJsonFile(outFile);
+      if (!data) {
+        const reason = ran.output.split(/\r?\n/).find((line) => line.startsWith('SCENARIO_FAIL')) ?? ran.output.trim().split(/\r?\n/).slice(-3).join('\n');
+        return this.createErrorResponse(`The scenario produced no result: ${reason || 'no output'}`, ['Check the scene with check_project_scripts']);
+      }
+      if (data.fatal) {
+        return this.createErrorResponse(data.fatal, ['Check scenePath and that the project is imported']);
+      }
+      const lines = (data.results as any[]).map((r) => `${r.ok ? 'ok  ' : 'FAIL'} #${r.index + 1}${r.name ? ` ${r.name}` : ''}: ${['wait', 'frames', 'press', 'key', 'click', 'set', 'call', 'assert', 'wait_until', 'assert_no_errors'].find((k) => k in r.step)}${r.message ? ` - ${r.message}` : ''}`);
+      const skipped = data.steps_total - data.results.length;
+      const summary = [
+        `${data.passed} of ${data.steps_total} step(s) passed${data.failed > 0 ? `, ${data.failed} failed` : ''}${skipped > 0 ? `, ${skipped} not run` : ''} in ${data.elapsed_ms} ms.`,
+        ...lines,
+        ...(data.errors.length > 0 ? ['', `The game printed ${data.errors.length} error(s); the first: ${String(data.errors[0].message).split('\n')[0].slice(0, 160)}`] : []),
+      ].join('\n');
+      return this.textResult(summary, data, data.failed > 0);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  /** Handle the visual_regression tool */
+  private async handleVisualRegression(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    const target = this.checkUiTarget({ ...args, sizes: undefined }, 1);
+    if ('error' in target) {
+      return target.error;
+    }
+    const problem = this.checkNumbers(args, { width: [64, 2048], height: [64, 2048], pixelTolerance: [0, 1], maxDifferentPercent: [0, 100] });
+    if (problem) {
+      return this.createErrorResponse(problem, ['Check the numbers'], { code: 'INVALID_ARGUMENT' });
+    }
+    if (args.mode !== undefined && args.mode !== 'compare' && args.mode !== 'update') {
+      return this.createErrorResponse('mode must be compare or update', ['Check mode'], { code: 'INVALID_ARGUMENT' });
+    }
+    const sceneName = basename(String(args.scenePath)).replace(/\.tscn$/, '');
+    const name: string = args.name ?? sceneName;
+    if (!/^[A-Za-z0-9_-]{1,60}$/.test(name)) {
+      return this.createErrorResponse('name can only have letters, digits, - and _ (up to 60)', ['Check name'], { code: 'INVALID_ARGUMENT' });
+    }
+    const resolvedDir = this.resolveInsideProject(args.projectPath, args.baselineDir ?? 'tests/visual');
+    if ('error' in resolvedDir) {
+      return this.createErrorResponse(`baselineDir: ${resolvedDir.error}`, ['Use a folder inside the project'], { code: 'INVALID_PATH' });
+    }
+    const projectRoot = target.projectRoot;
+    const width: number = args.width ?? 1280;
+    const height: number = args.height ?? 720;
+    const label = `${width}x${height}`;
+    const baseline = join(projectRoot, resolvedDir.relPath, `${name}_${label}.png`);
+    const baselineRel = `${resolvedDir.relPath}/${name}_${label}.png`;
+    const update = args.mode === 'update';
+    if (!update && !existsSync(baseline)) {
+      return this.createErrorResponse(`There is no saved picture yet: ${baselineRel}`, ['Run with mode update to save the current look as the reference'], { code: 'BASELINE_MISSING' });
+    }
+
+    const tempDir = mkdtempSync(join(tmpdir(), 'godot-mcp-visual-'));
+    try {
+      const ran = await this.runWindowedScript(this.renderSceneUiPath, projectRoot, [`res://${args.scenePath}`, tempDir, label], 120000);
+      if ('error' in ran) {
+        return ran.error;
+      }
+      const current = join(tempDir, `${label}.png`);
+      if (!existsSync(current)) {
+        const reason = ran.output.split(/\r?\n/).find((line) => line.startsWith('RENDER_FAIL')) ?? ran.output.trim().split(/\r?\n/).slice(-3).join('\n');
+        return this.createErrorResponse(`Godot did not draw the scene: ${reason || 'no output'}`, ['This tool needs a display and a graphics driver; it cannot run headless or without a display']);
+      }
+      const image = (file: string) => ({ type: 'image', data: readFileSync(file).toString('base64'), mimeType: 'image/png' });
+      if (update) {
+        mkdirSync(dirname(baseline), { recursive: true });
+        copyFileSync(current, baseline);
+        return { content: [{ type: 'text', text: `Saved ${baselineRel} as the reference look of ${args.scenePath}.` }, image(current)], isError: false };
+      }
+
+      const diffPng = join(tempDir, 'diff.png');
+      const diffJson = join(tempDir, 'diff.json');
+      const ranDiff = await this.runHeadlessScript(this.imageDiffPath, projectRoot, [baseline, current, diffPng, String(args.pixelTolerance ?? 0.02), diffJson], 180000);
+      if ('error' in ranDiff) {
+        return ranDiff.error;
+      }
+      const result = this.readJsonFile(diffJson);
+      if (!result) {
+        return this.createErrorResponse(`Godot could not compare the pictures: ${ranDiff.output.trim().split(/\r?\n/).slice(-2).join(' ')}`, ['Check that the saved picture is a PNG']);
+      }
+      if (result.size_mismatch) {
+        return {
+          content: [
+            { type: 'text', text: `The picture has another size: now ${result.current_size.join('x')}, saved ${result.baseline_size.join('x')}. Save a new reference with mode update if the change is intended.` },
+            image(current),
+          ],
+          isError: true,
+        };
+      }
+      const limit: number = args.maxDifferentPercent ?? 0.1;
+      const passes = result.percent <= limit;
+      const summary = `${args.scenePath} at ${label}: ${result.different_pixels} of ${result.total_pixels} pixels differ (${result.percent} %, limit ${limit} %), largest change ${result.max_delta}.${passes ? '' : ' Save a new reference with mode update if the change is intended.'}`;
+      const content: any[] = [{ type: 'text', text: summary }, { type: 'text', text: JSON.stringify({ ...result, baseline: baselineRel, limit, passes }, null, 2) }];
+      if (!passes) {
+        content.push({ type: 'text', text: 'Difference (red = changed):' }, image(diffPng), { type: 'text', text: 'Now:' }, image(current));
+      }
+      return { content, isError: !passes };
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  /** Handle the perf_budget tool */
+  private async handlePerfBudget(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    const target = this.checkUiTarget({ ...args, sizes: undefined }, 1);
+    if ('error' in target) {
+      return target.error;
+    }
+    const problem = this.checkNumbers(args, { seconds: [1, 60], warmup: [0, 10], width: [64, 4096], height: [64, 4096] });
+    if (problem) {
+      return this.createErrorResponse(problem, ['Check the numbers'], { code: 'INVALID_ARGUMENT' });
+    }
+    const budgetKeys: Record<string, [string, 'max' | 'min']> = {
+      maxFrameMsP95: ['frame_ms_p95', 'max'], minFps: ['fps', 'min'], maxDrawCalls: ['draw_calls_max', 'max'],
+      maxNodes: ['nodes_max', 'max'], maxMemoryMb: ['memory_mb', 'max'], maxVideoMemoryMb: ['video_memory_mb', 'max'],
+    };
+    const budget: Record<string, number> = {};
+    if (args.budget !== undefined) {
+      if (typeof args.budget !== 'object' || args.budget === null || Array.isArray(args.budget)) {
+        return this.createErrorResponse('budget must be an object', ['Check budget'], { code: 'INVALID_ARGUMENT' });
+      }
+      for (const [key, value] of Object.entries(args.budget as Record<string, unknown>)) {
+        if (!budgetKeys[key]) {
+          return this.createErrorResponse(`budget accepts ${Object.keys(budgetKeys).join(', ')}; not ${key}`, ['Check budget'], { code: 'INVALID_ARGUMENT' });
+        }
+        if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+          return this.createErrorResponse(`budget.${key} must be a number, 0 or more`, ['Check budget'], { code: 'INVALID_ARGUMENT' });
+        }
+        budget[key] = value;
+      }
+    }
+    const seconds: number = args.seconds ?? 3;
+    const warmup: number = args.warmup ?? 1;
+    const tempDir = mkdtempSync(join(tmpdir(), 'godot-mcp-perf-'));
+    try {
+      const outFile = join(tempDir, 'perf.json');
+      const ran = await this.runWindowedScript(
+        this.profileScenePath, target.projectRoot,
+        [`res://${args.scenePath}`, outFile, String(args.width ?? 1280), String(args.height ?? 720), String(warmup), String(seconds)],
+        (seconds + warmup + 60) * 1000
+      );
+      if ('error' in ran) {
+        return ran.error;
+      }
+      const result = this.readJsonFile(outFile);
+      if (!result) {
+        const reason = ran.output.split(/\r?\n/).find((line) => line.startsWith('PROFILE_FAIL')) ?? ran.output.trim().split(/\r?\n/).slice(-3).join('\n');
+        return this.createErrorResponse(`Godot did not measure the scene: ${reason || 'no output'}`, ['This tool needs a display and a graphics driver; it cannot run headless or without a display']);
+      }
+      const violations = Object.entries(budget).flatMap(([key, limit]) => {
+        const [metric, kind] = budgetKeys[key];
+        const actual = result[metric] as number;
+        const broken = kind === 'max' ? actual > limit : actual < limit;
+        return broken ? [{ limit: key, metric, actual, allowed: limit, message: `${metric} is ${actual}, ${kind === 'max' ? 'above' : 'below'} the limit of ${limit}` }] : [];
+      });
+      const summary = [
+        `${args.scenePath}: ${result.fps} fps over ${result.frames} frames at ${result.size.join('x')}. Frame time ${result.frame_ms_avg} ms average, ${result.frame_ms_p95} ms p95, ${result.frame_ms_max} ms worst.`,
+        `Draw calls up to ${result.draw_calls_max}, ${result.nodes_max} nodes, ${result.memory_mb} MB memory, ${result.video_memory_mb} MB video memory.`,
+        ...(Object.keys(budget).length > 0 ? [violations.length === 0 ? 'Within the budget.' : `Over the budget: ${violations.map((v) => v.message).join('; ')}.`] : []),
+      ].join('\n');
+      return this.textResult(summary, { ...result, budget, violations }, violations.length > 0);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  /** Handle the generate_tests tool */
+  private async handleGenerateTests(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    const target = this.checkProjectFolder(args);
+    if ('error' in target) {
+      return target.error;
+    }
+    if (typeof args.scriptPath !== 'string' || !args.scriptPath.endsWith('.gd')) {
+      return this.createErrorResponse('scriptPath must be a .gd file relative to the project', ['Check scriptPath'], { code: 'INVALID_ARGUMENT' });
+    }
+    if (args.overwrite !== undefined && typeof args.overwrite !== 'boolean') {
+      return this.createErrorResponse('overwrite must be true or false', ['Check overwrite'], { code: 'INVALID_ARGUMENT' });
+    }
+    const script = this.resolveInsideProject(args.projectPath, args.scriptPath);
+    if ('error' in script || !existsSync(join(target.projectRoot, script.relPath))) {
+      return this.createErrorResponse(`Script not found: ${args.scriptPath}`, ['Check the path relative to the project'], { code: 'INVALID_PATH' });
+    }
+    const testDir = this.resolveInsideProject(args.projectPath, args.testDir ?? 'test/unit');
+    if ('error' in testDir) {
+      return this.createErrorResponse(`testDir: ${testDir.error}`, ['Use a folder inside the project'], { code: 'INVALID_PATH' });
+    }
+    const testRel = `${testDir.relPath}/test_${basename(script.relPath)}`;
+    const testFile = join(target.projectRoot, testRel);
+    if (existsSync(testFile) && args.overwrite !== true) {
+      return this.createErrorResponse(`${testRel} already exists`, ['Pass overwrite to replace it, or choose another testDir'], { code: 'INVALID_ARGUMENT' });
+    }
+    try {
+      const parsed = parseScript(readFileSync(join(target.projectRoot, script.relPath), 'utf8'));
+      let checkpoint: string | undefined;
+      if (existsSync(testFile)) {
+        checkpoint = createCheckpoint(target.projectRoot, { label: `before replacing ${testRel}`, paths: [testRel] }).id;
+      }
+      mkdirSync(dirname(testFile), { recursive: true });
+      writeFileSync(testFile, buildGutTest(script.relPath, parsed));
+      const publicFunctions = parsed.functions.filter((f) => !f.name.startsWith('_'));
+      const hasGut = existsSync(join(target.projectRoot, 'addons', 'gut'));
+      return this.textResult(
+        [
+          `Wrote ${testRel}: ${publicFunctions.length} pending test(s) for functions, ${parsed.signals.length} signal check(s).`,
+          ...(hasGut ? [] : ['GUT is not installed in addons/gut, which run_tests needs.']),
+          ...(checkpoint ? [`The earlier file was saved in checkpoint ${checkpoint}.`] : []),
+        ].join('\n'),
+        { test: testRel, functions: publicFunctions.map((f) => f.name), signals: parsed.signals, gutInstalled: hasGut, checkpoint }
+      );
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to write the test: ${error?.message || 'Unknown error'}`, ['Check that the project folder is writable']);
     }
   }
 
