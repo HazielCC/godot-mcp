@@ -495,13 +495,18 @@ func add_node(params: Dictionary) -> void:
     if debug_mode:
         print("Parent path: " + parent_path)
 
-    var parent: Node = scene_root
-    if parent_path != "root":
-        parent = scene_root.get_node(parent_path.replace("root/", ""))
-        if not parent:
-            printerr("Failed to add node: parent node not found: " + parent_path)
-            quit(1)
-            return
+    # The path starts with the name of the scene root, or with "root" (the name create_scene gives it).
+    var parent: Node = _find_node(scene_root, str(scene_root.name), parent_path)
+    if parent == null:
+        printerr("Failed to add node: parent node not found: " + parent_path)
+        scene_root.free()
+        quit(1)
+        return
+    if parent.get_node_or_null(str(params.node_name)) != null:
+        printerr("Failed to add node: a node named " + str(params.node_name) + " already exists under " + parent_path)
+        scene_root.free()
+        quit(1)
+        return
     if debug_mode:
         print("Parent node found: " + parent.name)
 
@@ -512,7 +517,9 @@ func add_node(params: Dictionary) -> void:
         printerr("Failed to instantiate node of type: " + params.node_type)
         printerr("Make sure the class exists and can be instantiated")
         printerr("Check if the class is registered in ClassDB or available as a script")
+        scene_root.free()
         quit(1)
+        return
     new_node.name = params.node_name
     if debug_mode:
         print("New node created with name: " + new_node.name)
@@ -630,11 +637,6 @@ func load_sprite(params: Dictionary) -> void:
     if debug_mode:
         print("Original node path: " + node_path)
 
-    if node_path.begins_with("root/"):
-        node_path = node_path.substr(5)  # Remove "root/" prefix
-        if debug_mode:
-            print("Node path after removing 'root/' prefix: " + node_path)
-
     # Typed as Variant: the sprite can be Sprite2D, Sprite3D or TextureRect, and the
     # texture property is set after the type check below.
     var sprite_node: Variant = null
@@ -644,7 +646,8 @@ func load_sprite(params: Dictionary) -> void:
         if debug_mode:
             print("Using root node as sprite node")
     else:
-        sprite_node = scene_root.get_node(node_path)
+        # The path starts with the name of the scene root, or with "root".
+        sprite_node = _find_node(scene_root, str(scene_root.name), node_path)
         if sprite_node and debug_mode:
             print("Found sprite node: " + sprite_node.name)
 
@@ -991,7 +994,8 @@ func resave_resources(params: Dictionary) -> void:
 
     # Get project path if provided
     var project_path: String = "res://"
-    if params.has("project_path"):
+    # Only a path inside the project is used; an absolute path would be read as a folder in the project.
+    if params.has("project_path") and (str(params.project_path).begins_with("res://") or not str(params.project_path).is_absolute_path()):
         project_path = params.project_path
         if not project_path.begins_with("res://"):
             project_path = "res://" + project_path
@@ -1351,12 +1355,17 @@ func inspect_node(params: Dictionary) -> void:
     print("INSPECT_OK")
 
 # Find a node from a path that starts with the root name (for example "root/Player").
+# "root" also names the root, because create_scene calls it that and older calls use it.
 func _find_node(scene_root: Node, root_name: String, node_path: String) -> Node:
     var relative_path: String = node_path
     if node_path == root_name:
         relative_path = "."
     elif node_path.begins_with(root_name + "/"):
         relative_path = node_path.substr(root_name.length() + 1)
+    elif node_path == "root" and scene_root.get_node_or_null("root") == null:
+        relative_path = "."
+    elif node_path.begins_with("root/") and scene_root.get_node_or_null("root") == null:
+        relative_path = node_path.substr(5)
     return scene_root if relative_path == "." else scene_root.get_node_or_null(relative_path)
 
 func _has_property(node: Object, property_name: String) -> bool:
