@@ -170,13 +170,14 @@ Use this configuration:
 | `update_project_uids` | Updates UID references by resaving resources (Godot 4.4+) |
 | `check_script` | Checks one `.gd` file for syntax errors without running the project, with file and line |
 | `check_project_scripts` | Checks every `.gd` file in a project for parse and compile errors, with the autoloads registered. One Godot process checks the whole project |
-| `run_tests` | Runs the GUT tests headless and returns totals, each failing test with its message, and script errors. Options: `directory`, `select` (script file name), `testName`, `importFirst`, `timeoutMs` |
+| `run_tests` | Runs the GUT tests headless and returns totals, each failing test with its message, and script errors. Options: `directory`, `select` (script file name), `testName`, `importFirst`, `timeoutMs`, `rerunFailed` (reruns only the files that failed in the last full run, which is saved in `.godot/mcp_tests_last.json`), `junitPath` (writes a JUnit XML file inside the project for CI) |
 | `diagnose_project` | Checks the Godot executable and version, the project file, the import cache, importable assets without a `.import` file, and `.import` files with missing outputs. Option: `runImport` |
 | `read_scene` | Reads a `.tscn` scene as a node tree, with each node's type, path (such as `root/Player`), and properties |
 | `set_node_property` | Sets one property on a node of an existing scene and saves it. The value is a Godot literal, such as `Vector2(1, 2)` |
 | `install_editor_bridge` | Installs the Godot MCP Bridge plugin in a project and enables it, so the server can drive the project while the editor has it open |
 | `editor_status` | Checks whether the project is open in the editor with the bridge enabled, and reports the open scene and whether it is playing |
 | `editor_command` | Runs one command in the open editor: scene tree, open or save a scene, get or set a property (with undo), add a node, undo, redo, play, stop |
+| `verify_game` | Plays a scene with a probe, checks that the frame counter keeps advancing, takes a screenshot, lists the runtime errors and stops the game. Needs the editor open with the bridge |
 
 ## Building from source
 

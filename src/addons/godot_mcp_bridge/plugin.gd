@@ -16,6 +16,11 @@ const PORT_FIRST: int = 47800
 const PORT_LAST: int = 47899
 const MAX_LINE_BYTES: int = 1048576
 const MAX_TREE_NODES: int = 500
+const PROBE_DIR: String = "res://.godot/mcp_probe"
+const PROBE_SCRIPT: String = "res://addons/godot_mcp_bridge/mcp_probe.gd"
+const PROBE_WRAPPER: String = "res://.godot/mcp_probe/run.tscn"
+const PROBE_STATUS: String = "res://.godot/mcp_probe/status.json"
+const PROBE_REQUEST: String = "res://.godot/mcp_probe/request.json"
 
 var _server: TCPServer = null
 var _clients: Array[StreamPeerTCP] = []
@@ -146,6 +151,10 @@ func _run_command(command: String, arguments: Dictionary) -> Dictionary:
         "refresh_filesystem":
             EditorInterface.get_resource_filesystem().scan()
             return _ok({"scanned": true})
+        "probe_status":
+            return _probe_status()
+        "probe_capture":
+            return _probe_capture(arguments)
         _:
             return _error("Unknown command: " + command)
 
@@ -270,9 +279,70 @@ func _play(arguments: Dictionary) -> Dictionary:
             if not _is_project_path(path, ".tscn"):
                 return _error("path must be a res:// .tscn path inside the project")
             EditorInterface.play_custom_scene(path)
+        "probe":
+            return _play_probe(arguments)
         _:
-            return _error("mode must be main, current or custom")
+            return _error("mode must be main, current, custom or probe")
     return _ok({"playing": mode})
+
+# Runs a scene with the probe attached (see mcp_probe.gd). The probe lives in a wrapper scene,
+# so the project itself is not changed. The scene runs as it is on disk, so the editor saves
+# it first when it is the one open.
+func _play_probe(arguments: Dictionary) -> Dictionary:
+    var root: Node = EditorInterface.get_edited_scene_root()
+    var target: String = str(arguments.get("scene", ""))
+    if target == "" and root != null:
+        target = root.scene_file_path
+    if not _is_project_path(target, ".tscn"):
+        return _error("Pass scene as a res:// .tscn path, or open a saved scene in the editor")
+    if not FileAccess.file_exists(target):
+        return _error("Scene not found: " + target)
+    if not FileAccess.file_exists(PROBE_SCRIPT):
+        return _error("The probe script is missing; run install_editor_bridge again")
+    if root != null and root.scene_file_path == target:
+        var saved: Error = EditorInterface.save_scene()
+        if saved != OK:
+            return _error("Could not save the scene before running it: error %d" % saved)
+
+    _remove_probe_file(PROBE_STATUS)
+    _remove_probe_file(PROBE_REQUEST)
+    DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(PROBE_DIR))
+    # Each run has its own session, so a game left running from an earlier run cannot answer for this one.
+    var session: String = "%d-%d" % [Time.get_ticks_usec(), randi()]
+    var wrapper_text: String = "[gd_scene format=3]\n\n[ext_resource type=\"Script\" path=\"%s\" id=\"1\"]\n\n[node name=\"McpProbe\" type=\"Node\"]\nscript = ExtResource(\"1\")\ntarget_scene = %s\nsession = %s\n" % [PROBE_SCRIPT, var_to_str(target), var_to_str(session)]
+    var file: FileAccess = FileAccess.open(PROBE_WRAPPER, FileAccess.WRITE)
+    if file == null:
+        return _error("Could not write " + PROBE_WRAPPER)
+    file.store_string(wrapper_text)
+    file.close()
+    EditorInterface.play_custom_scene(PROBE_WRAPPER)
+    return _ok({"playing": "probe", "target": target, "session": session})
+
+func _probe_status() -> Dictionary:
+    if not FileAccess.file_exists(PROBE_STATUS):
+        return _error("The probe has not reported yet; play with mode probe first")
+    var parsed: Variant = JSON.parse_string(FileAccess.get_file_as_string(PROBE_STATUS))
+    if typeof(parsed) != TYPE_DICTIONARY:
+        return _error("The probe status is being written; ask again")
+    return _ok({"status": parsed})
+
+# Asks the running probe for a screenshot. The answer is in probe_status once capture_id matches.
+func _probe_capture(arguments: Dictionary) -> Dictionary:
+    if not EditorInterface.is_playing_scene():
+        return _error("No scene is playing")
+    var request_id: String = str(arguments.get("id", str(Time.get_ticks_msec())))
+    if not request_id.is_valid_filename():
+        return _error("id must be usable in a file name")
+    var file: FileAccess = FileAccess.open(PROBE_REQUEST, FileAccess.WRITE)
+    if file == null:
+        return _error("Could not write " + PROBE_REQUEST)
+    file.store_string(JSON.stringify({"id": request_id, "capture": true, "session": str(arguments.get("session", ""))}))
+    file.close()
+    return _ok({"requested": request_id})
+
+func _remove_probe_file(path: String) -> void:
+    if FileAccess.file_exists(path):
+        DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
 
 # ---------------------------------------------------------------- helpers
 

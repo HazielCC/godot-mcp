@@ -40,8 +40,33 @@ const __dirname = dirname(__filename);
 /** Commands the editor bridge accepts (see src/addons/godot_mcp_bridge/plugin.gd). */
 const EDITOR_BRIDGE_COMMANDS = [
   'status', 'scene_tree', 'open_scene', 'save_scene', 'get_property', 'set_property',
-  'add_node', 'undo', 'redo', 'play', 'stop', 'refresh_filesystem',
+  'add_node', 'undo', 'redo', 'play', 'stop', 'refresh_filesystem', 'probe_status', 'probe_capture',
 ];
+
+/** Codes for errors a caller can act on. Errors without a code report OPERATION_FAILED. */
+type ToolErrorCode =
+  | 'INVALID_ARGUMENT'
+  | 'INVALID_PATH'
+  | 'PROJECT_NOT_FOUND'
+  | 'GODOT_NOT_FOUND'
+  | 'IMPORT_FAILED'
+  | 'TEST_DIRECTORY_NOT_FOUND'
+  | 'TESTS_NOT_RUN'
+  | 'TIMEOUT'
+  | 'EDITOR_NOT_CONNECTED'
+  | 'EDITOR_TIMEOUT'
+  | 'EDITOR_REFUSED'
+  | 'PROBE_NOT_READY'
+  | 'OPERATION_FAILED';
+
+/** Codes where repeating the same call later may succeed without changing its arguments. */
+const RETRYABLE_ERROR_CODES: ToolErrorCode[] =['TIMEOUT', 'EDITOR_TIMEOUT', 'PROBE_NOT_READY'];
+
+/** One test result, as read from GUT's JUnit XML. */
+type TestRecord = { suite: string; name: string; status: string; time: number; message?: string };
+
+/** The last full run_tests result of a project, kept in .godot/mcp_tests_last.json for rerunFailed. */
+type TestState = { directory: string; savedAt: string; tests: TestRecord[] };
 
 /** Properties that are stored inside the node's transform (see setPropertyInInheritedScene). */
 const TRANSFORM_PROPERTIES = ['position', 'rotation', 'rotation_degrees', 'scale', 'skew'];
@@ -411,9 +436,11 @@ class GodotServer {
   /**
    * Create a standardized error response with possible solutions
    */
-  private createErrorResponse(message: string, possibleSolutions: string[] = []): any {
+  private createErrorResponse(message: string, possibleSolutions: string[] = [], options: { code?: ToolErrorCode } = {}): any {
+    const code: ToolErrorCode = options.code ?? 'OPERATION_FAILED';
+    const retryable = RETRYABLE_ERROR_CODES.includes(code);
     // Log the error
-    console.error(`[SERVER] Error response: ${message}`);
+    console.error(`[SERVER] Error response (${code}): ${message}`);
     if (possibleSolutions.length > 0) {
       console.error(`[SERVER] Possible solutions: ${possibleSolutions.join(', ')}`);
     }
@@ -424,8 +451,13 @@ class GodotServer {
           type: 'text',
           text: message,
         },
+        {
+          type: 'text',
+          text: `Error code: ${code} (retryable: ${retryable ? 'yes' : 'no'})`,
+        },
       ],
       isError: true,
+      structuredContent: { error: { code, message, retryable } },
     };
 
     if (possibleSolutions.length > 0) {
@@ -1203,7 +1235,7 @@ class GodotServer {
         },
         {
           name: 'run_tests',
-          description: 'Run the project GUT tests headless and return structured results: totals, each failing test with its message, and script errors. Imports the project first unless importFirst is false. The call waits until the run finishes, which can take minutes on large suites.',
+          description: 'Run the project GUT tests headless and return structured results: totals, each failing test with its message, and script errors. Imports the project first unless importFirst is false. The call waits until the run finishes, which can take minutes on large suites. A full run is saved so that rerunFailed can rerun only its failing files, and junitPath writes the results for CI.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1230,6 +1262,14 @@ class GodotServer {
               timeoutMs: {
                 type: 'number',
                 description: 'Maximum time to wait for the run, in milliseconds (default 600000, max 3600000)',
+              },
+              rerunFailed: {
+                type: 'boolean',
+                description: 'Rerun only the test files that failed in the last full run of this project, and update those results. Cannot be combined with directory, select or testName.',
+              },
+              junitPath: {
+                type: 'string',
+                description: 'Also write the results as a JUnit XML file at this path inside the project, such as reports/junit.xml. CI test reporters, including GitHub Actions, read this format.',
               },
             },
             required: ['projectPath'],
@@ -1331,7 +1371,7 @@ class GodotServer {
         },
         {
           name: 'editor_command',
-          description: 'Run one command in the open Godot editor through the Godot MCP Bridge. Commands: status, scene_tree, open_scene (path), save_scene, get_property (node_path, property), set_property (node_path, property, value as a Godot literal), add_node (parent_path, type, name), undo, redo, play (mode: main, current or custom with path), stop, refresh_filesystem. Changes made this way go through the editor undo history. Node paths start with the scene root name, such as "root/Player".',
+          description: 'Run one command in the open Godot editor through the Godot MCP Bridge. Commands: status, scene_tree, open_scene (path), save_scene, get_property (node_path, property), set_property (node_path, property, value as a Godot literal), add_node (parent_path, type, name), undo, redo, play (mode: main, current, custom with path, or probe with an optional scene; probe returns a session), stop, refresh_filesystem, probe_status (session: state of the probe for that run), probe_capture (id and session, taken from probe_status: asks the probe for a screenshot). Changes made this way go through the editor undo history. Node paths start with the scene root name, such as "root/Player".',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1350,6 +1390,32 @@ class GodotServer {
               },
             },
             required: ['projectPath', 'command'],
+          },
+        },
+        {
+          name: 'verify_game',
+          description: 'Check that a scene really runs in the Godot editor that has the bridge open: play it with the probe, confirm the frame counter keeps advancing during durationMs, take a screenshot, collect the runtime errors Godot reports, and stop the game. A game that freezes shows as not advancing. Needs install_editor_bridge and the project open in the editor.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scene: {
+                type: 'string',
+                description: 'res:// path of the scene to run. Defaults to the scene open in the editor, which must be saved.',
+              },
+              durationMs: {
+                type: 'number',
+                description: 'How long to watch the frame counter, from 500 to 60000 ms. Default 3000.',
+              },
+              capture: {
+                type: 'boolean',
+                description: 'Take a screenshot of the game. Default true.',
+              },
+            },
+            required: ['projectPath'],
           },
         },
       ],
@@ -1406,6 +1472,8 @@ class GodotServer {
           return await this.handleEditorStatus(request.params.arguments);
         case 'editor_command':
           return await this.handleEditorCommand(request.params.arguments);
+        case 'verify_game':
+          return await this.handleVerifyGame(request.params.arguments);
         case 'read_scene':
           return await this.handleReadScene(request.params.arguments);
         case 'set_node_property':
@@ -2254,6 +2322,168 @@ class GodotServer {
     }
   }
 
+  /** The last full run_tests result of a project, or undefined when there is none or it cannot be read. */
+  private readTestState(projectRoot: string): TestState | undefined {
+    const file = join(projectRoot, '.godot', 'mcp_tests_last.json');
+    if (!existsSync(file)) {
+      return undefined;
+    }
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf8'));
+      if (typeof parsed?.directory === 'string' && Array.isArray(parsed?.tests)) {
+        return parsed as TestState;
+      }
+    } catch {
+      // A damaged file counts as no earlier result.
+    }
+    return undefined;
+  }
+
+  private writeTestState(projectRoot: string, state: TestState): void {
+    mkdirSync(join(projectRoot, '.godot'), { recursive: true });
+    writeFileSync(join(projectRoot, '.godot', 'mcp_tests_last.json'), JSON.stringify(state, null, 2));
+  }
+
+  /** Write the results as a JUnit XML file, the format CI test reporters such as GitHub Actions read. */
+  private writeJunitFile(projectRoot: string, relPath: string, tests: TestRecord[]): void {
+    const target = join(projectRoot, relPath);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, this.buildJunitXml(tests));
+  }
+
+  private buildJunitXml(tests: TestRecord[]): string {
+    const attr = (value: string): string =>
+      value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    const cdata = (value: string): string => value.replace(/]]>/g, ']]]]><![CDATA[>');
+    const seconds = (value: number): string => (Number.isFinite(value) ? value : 0).toFixed(6);
+    const count = (list: TestRecord[], status: string): number => list.filter((t) => t.status === status).length;
+    const total = (list: TestRecord[]): number => list.reduce((sum, t) => sum + (Number.isFinite(t.time) ? t.time : 0), 0);
+
+    const suites = new Map<string, TestRecord[]>();
+    for (const test of tests) {
+      suites.set(test.suite, [...(suites.get(test.suite) ?? []), test]);
+    }
+
+    const lines: string[] = [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      `<testsuites name="GutTests" tests="${tests.length}" failures="${count(tests, 'fail')}" skipped="${count(tests, 'pending')}" time="${seconds(total(tests))}">`,
+    ];
+    for (const [suite, list] of suites) {
+      lines.push(`  <testsuite name="${attr(suite)}" tests="${list.length}" failures="${count(list, 'fail')}" skipped="${count(list, 'pending')}" time="${seconds(total(list))}">`);
+      for (const test of list) {
+        lines.push(`    <testcase name="${attr(test.name)}" classname="${attr(test.suite)}" time="${seconds(test.time)}">`);
+        if (test.status === 'fail') {
+          lines.push(`      <failure message="failed"><![CDATA[${cdata(test.message ?? 'failed')}]]></failure>`);
+        } else if (test.status === 'pending') {
+          lines.push(`      <skipped message="pending"><![CDATA[${cdata(test.message ?? '')}]]></skipped>`);
+        }
+        lines.push('    </testcase>');
+      }
+      lines.push('  </testsuite>');
+    }
+    lines.push('</testsuites>');
+    return lines.join('\n') + '\n';
+  }
+
+  /**
+   * Rerun only the test files that failed in the last full run, then update those tests in the saved result.
+   * GUT's -gselect matches file names, so each failing file runs once by its name. Only the tests that
+   * failed before are taken from the rerun; the rest of the last full run stays as it was.
+   */
+  private async rerunFailedTests(
+    projectRoot: string,
+    previous: TestState,
+    timeoutMs: number,
+    junitRelPath?: string
+  ): Promise<any> {
+    const tests: TestRecord[] = previous.tests.map((t) => ({ ...t }));
+    const failedBefore: TestRecord[] = tests.filter((t) => t.status === 'fail').map((t) => ({ ...t }));
+    const files = [...new Set(failedBefore.map((t) => t.suite))];
+    const outputs: string[] = [];
+
+    for (const file of files) {
+      const fileName = file.split('/').pop() ?? file;
+      const run = await this.runGutTests(projectRoot, { directory: previous.directory, select: fileName, timeoutMs });
+      if (run.timedOut) {
+        return this.createErrorResponse(
+          `The rerun of ${file} did not finish within ${timeoutMs} ms`,
+          ['Increase timeoutMs, or run the full suite without rerunFailed'],
+          { code: 'TIMEOUT' }
+        );
+      }
+      outputs.push(`${run.stdout}\n${run.stderr}`);
+      const fresh = run.junitXml ? this.parseJunitXml(run.junitXml).tests : [];
+      for (const test of tests) {
+        if (test.status !== 'fail' || test.suite !== file) {
+          continue;
+        }
+        const again = fresh.find((f) => f.suite === file && f.name === test.name);
+        if (again) {
+          test.status = again.status;
+          test.time = again.time;
+          test.message = again.message;
+        } else {
+          test.message = 'Not found when rerunning this file; run the full suite again';
+        }
+      }
+    }
+
+    const nowPassing = tests.filter(
+      (t) => t.status === 'pass' && failedBefore.some((b) => b.suite === t.suite && b.name === t.name)
+    ).length;
+    const passed = tests.filter((t) => t.status === 'pass').length;
+    const failures = tests.filter((t) => t.status === 'fail');
+    const pendingTests = tests.filter((t) => t.status === 'pending');
+    const scriptErrors = this.groupScriptErrors(this.parseScriptErrors(outputs.join('\n')));
+    this.writeTestState(projectRoot, { directory: previous.directory, savedAt: new Date().toISOString(), tests });
+    if (junitRelPath) {
+      this.writeJunitFile(projectRoot, junitRelPath, tests);
+    }
+
+    const summary: string[] = [
+      files.length === 0
+        ? 'No failing tests in the last full run, so nothing was rerun.'
+        : `Reran ${files.length} file(s) with failures: ${failedBefore.length} test(s) rechecked, ${nowPassing} now passing, ${failures.length} still failing.`,
+      `Last full run: ${tests.length} tests | passed: ${passed} | failed: ${failures.length} | pending: ${pendingTests.length}`,
+    ];
+    if (failures.length > 0) {
+      summary.push('', 'Failures:');
+      for (const failure of failures) {
+        summary.push(`- ${failure.suite}::${failure.name}`);
+        if (failure.message) {
+          summary.push(`    ${failure.message.split(/\r?\n/).slice(0, 3).join('\n    ').slice(0, 300)}`);
+        }
+      }
+    }
+    if (scriptErrors.scriptErrors.length > 0) {
+      summary.push('', 'Script errors:');
+      for (const error of scriptErrors.scriptErrors) {
+        summary.push(`- ${error.file}:${error.line}: ${error.message}${error.count > 1 ? ` (x${error.count})` : ''}`);
+      }
+    }
+
+    const details = {
+      rerun: { files, rechecked: failedBefore.length, nowPassing, stillFailing: failures.length },
+      total: tests.length,
+      passed,
+      failed: failures.length,
+      pending: pendingTests.length,
+      failures: failures.map((f) => ({ suite: f.suite, name: f.name, message: f.message?.slice(0, 2000), time: f.time })),
+      pendingTests: pendingTests.map((p) => ({ suite: p.suite, name: p.name })),
+      scriptErrors: scriptErrors.scriptErrors,
+      scriptErrorsOmitted: scriptErrors.scriptErrorsOmitted,
+      junitPath: junitRelPath,
+    };
+
+    return {
+      content: [
+        { type: 'text', text: summary.join('\n') },
+        { type: 'text', text: JSON.stringify(details, null, 2) },
+      ],
+      isError: failures.length > 0 || scriptErrors.scriptErrors.length > 0,
+    };
+  }
+
   /**
    * Handle the run_tests tool: run the GUT tests and return structured results.
    */
@@ -2263,21 +2493,32 @@ class GodotServer {
     if (typeof args.projectPath !== 'string' || !args.projectPath) {
       return this.createErrorResponse(
         'Project path is required',
-        ['Provide a valid path to a Godot project directory']
+        ['Provide a valid path to a Godot project directory'],
+        { code: 'INVALID_ARGUMENT' }
       );
     }
 
     if (!this.validatePath(args.projectPath)) {
       return this.createErrorResponse(
         'Invalid project path',
-        ['Provide a valid path without ".." or other potentially unsafe characters']
+        ['Provide a valid path without ".." or other potentially unsafe characters'],
+        { code: 'INVALID_PATH' }
       );
     }
 
-    for (const key of ['directory', 'select', 'testName']) {
+    for (const key of ['directory', 'select', 'testName', 'junitPath']) {
       if (args[key] !== undefined && typeof args[key] !== 'string') {
-        return this.createErrorResponse(`${key} must be text`, ['Provide it as a string']);
+        return this.createErrorResponse(`${key} must be text`, ['Provide it as a string'], { code: 'INVALID_ARGUMENT' });
       }
+    }
+
+    const rerunFailed = args.rerunFailed === true;
+    if (rerunFailed && (args.directory !== undefined || args.select !== undefined || args.testName !== undefined)) {
+      return this.createErrorResponse(
+        'rerunFailed cannot be combined with directory, select or testName',
+        ['Use rerunFailed alone, or run the tests with the filters you need'],
+        { code: 'INVALID_ARGUMENT' }
+      );
     }
 
     const projectRoot = resolvePath(args.projectPath);
@@ -2287,23 +2528,51 @@ class GodotServer {
         [
           'Ensure the path points to a directory containing a project.godot file',
           'Use list_projects to find valid Godot projects',
-        ]
+        ],
+        { code: 'PROJECT_NOT_FOUND' }
       );
     }
 
-    const directory = String(args.directory ?? 'res://test').replace(/\\/g, '/');
-    if (!directory.startsWith('res://') || directory.includes('..')) {
+    let junitRelPath: string | undefined;
+    if (args.junitPath !== undefined) {
+      const resolved = this.resolveInsideProject(args.projectPath, args.junitPath);
+      if ('error' in resolved) {
+        return this.createErrorResponse(
+          `junitPath: ${resolved.error}`,
+          ['Give a path inside the project, such as reports/junit.xml'],
+          { code: 'INVALID_PATH' }
+        );
+      }
+      junitRelPath = resolved.relPath;
+    }
+
+    // rerunFailed works from the result of the last full run, so it has no directory of its own to check.
+    const previous = rerunFailed ? this.readTestState(projectRoot) : undefined;
+    if (rerunFailed && !previous) {
       return this.createErrorResponse(
-        `Invalid test directory: ${directory}`,
-        ['Use a res:// path such as res://test']
+        'There is no earlier run_tests result in this project to rerun',
+        ['Run run_tests without rerunFailed first'],
+        { code: 'INVALID_ARGUMENT' }
       );
     }
-    const directoryOnDisk = join(projectRoot, directory.slice('res://'.length));
-    if (!existsSync(directoryOnDisk) || !statSync(directoryOnDisk).isDirectory()) {
-      return this.createErrorResponse(
-        `Test directory not found: ${directory}`,
-        ['Check the directory relative to the project root']
-      );
+
+    const directory = previous ? previous.directory : String(args.directory ?? 'res://test').replace(/\\/g, '/');
+    if (!previous) {
+      if (!directory.startsWith('res://') || directory.includes('..')) {
+        return this.createErrorResponse(
+          `Invalid test directory: ${directory}`,
+          ['Use a res:// path such as res://test'],
+          { code: 'INVALID_ARGUMENT' }
+        );
+      }
+      const directoryOnDisk = join(projectRoot, directory.slice('res://'.length));
+      if (!existsSync(directoryOnDisk) || !statSync(directoryOnDisk).isDirectory()) {
+        return this.createErrorResponse(
+          `Test directory not found: ${directory}`,
+          ['Check the directory relative to the project root'],
+          { code: 'TEST_DIRECTORY_NOT_FOUND' }
+        );
+      }
     }
 
     const requestedTimeout = typeof args.timeoutMs === 'number' && args.timeoutMs > 0 ? args.timeoutMs : 600000;
@@ -2318,7 +2587,8 @@ class GodotServer {
             [
               'Ensure Godot is installed correctly',
               'Set GODOT_PATH environment variable to specify the correct path',
-            ]
+            ],
+            { code: 'GODOT_NOT_FOUND' }
           );
         }
       }
@@ -2328,9 +2598,14 @@ class GodotServer {
         if (importOutput !== undefined) {
           return this.createErrorResponse(
             `Godot import failed:\n${importOutput.slice(0, 1500)}`,
-            ['Open the project in the Godot editor to see the import errors', 'Run again with importFirst set to false if the project is already imported']
+            ['Open the project in the Godot editor to see the import errors', 'Run again with importFirst set to false if the project is already imported'],
+            { code: 'IMPORT_FAILED' }
           );
         }
+      }
+
+      if (previous) {
+        return await this.rerunFailedTests(projectRoot, previous, timeoutMs, junitRelPath);
       }
 
       this.logDebug(`Running GUT tests in ${directory}`);
@@ -2344,7 +2619,8 @@ class GodotServer {
       if (run.timedOut) {
         return this.createErrorResponse(
           `The tests did not finish within ${timeoutMs} ms`,
-          ['Increase timeoutMs, or narrow the run with select or testName']
+          ['Increase timeoutMs, or narrow the run with select or testName'],
+          { code: 'TIMEOUT' }
         );
       }
 
@@ -2357,7 +2633,8 @@ class GodotServer {
           [
             'Check that the test directory contains GUT test scripts (test_*.gd)',
             'Check the select and testName filters',
-          ]
+          ],
+          { code: 'TESTS_NOT_RUN' }
         );
       }
 
@@ -2365,8 +2642,18 @@ class GodotServer {
       if (parsed.tests.length === 0) {
         return this.createErrorResponse(
           'No tests were run',
-          ['Check that the test directory contains GUT test scripts (test_*.gd)', 'Check the select and testName filters']
+          ['Check that the test directory contains GUT test scripts (test_*.gd)', 'Check the select and testName filters'],
+          { code: 'TESTS_NOT_RUN' }
         );
+      }
+
+      // A full run becomes the result that rerunFailed works from. A filtered run leaves that result as it was.
+      const filtered = args.select !== undefined || args.testName !== undefined;
+      if (!filtered) {
+        this.writeTestState(projectRoot, { directory, savedAt: new Date().toISOString(), tests: parsed.tests });
+      }
+      if (junitRelPath) {
+        this.writeJunitFile(projectRoot, junitRelPath, parsed.tests);
       }
 
       const failures = parsed.tests.filter((t) => t.status === 'fail');
@@ -2411,6 +2698,8 @@ class GodotServer {
         scriptErrors: scriptErrors.scriptErrors,
         scriptErrorsOmitted: scriptErrors.scriptErrorsOmitted,
         exitCode: run.exitCode,
+        junitPath: junitRelPath,
+        savedForRerun: !filtered,
       };
 
       return {
@@ -3428,19 +3717,19 @@ class GodotServer {
     info: { port: number; token: string },
     command: string,
     args: Record<string, unknown>
-  ): Promise<{ ok: boolean; result?: any; error?: string }> {
+  ): Promise<{ ok: boolean; result?: any; error?: string; code?: ToolErrorCode }> {
     return new Promise((resolve) => {
       const socket = net.createConnection({ host: '127.0.0.1', port: info.port });
       let data = '';
       let settled = false;
-      const finish = (value: { ok: boolean; result?: any; error?: string }) => {
+      const finish = (value: { ok: boolean; result?: any; error?: string; code?: ToolErrorCode }) => {
         if (!settled) {
           settled = true;
           socket.destroy();
           resolve(value);
         }
       };
-      socket.setTimeout(15000, () => finish({ ok: false, error: 'The editor did not answer within 15 seconds' }));
+      socket.setTimeout(15000, () => finish({ ok: false, error: 'The editor did not answer within 15 seconds', code: 'EDITOR_TIMEOUT' }));
       socket.on('connect', () => {
         socket.write(JSON.stringify({ id: 1, token: info.token, command, arguments: args }) + '\n');
       });
@@ -3451,12 +3740,12 @@ class GodotServer {
           try {
             finish(JSON.parse(data.slice(0, newline)));
           } catch {
-            finish({ ok: false, error: 'The editor bridge sent an answer that is not valid JSON' });
+            finish({ ok: false, error: 'The editor bridge sent an answer that is not valid JSON', code: 'EDITOR_REFUSED' });
           }
         }
       });
-      socket.on('error', (error: Error) => finish({ ok: false, error: `Could not reach the editor bridge: ${error.message}` }));
-      socket.on('close', () => finish({ ok: false, error: 'The editor closed the connection without answering' }));
+      socket.on('error', (error: Error) => finish({ ok: false, error: `Could not reach the editor bridge: ${error.message}`, code: 'EDITOR_NOT_CONNECTED' }));
+      socket.on('close', () => finish({ ok: false, error: 'The editor closed the connection without answering', code: 'EDITOR_NOT_CONNECTED' }));
     });
   }
 
@@ -3513,10 +3802,10 @@ class GodotServer {
    */
   private async handleEditorStatus(args: any) {
     if (typeof args?.projectPath !== 'string' || !args.projectPath) {
-      return this.createErrorResponse('Project path is required', ['Provide a valid path to a Godot project directory']);
+      return this.createErrorResponse('Project path is required', ['Provide a valid path to a Godot project directory'], { code: 'INVALID_ARGUMENT' });
     }
     if (!this.validatePath(args.projectPath)) {
-      return this.createErrorResponse('Invalid project path', ['Provide a valid path without ".." or other potentially unsafe characters']);
+      return this.createErrorResponse('Invalid project path', ['Provide a valid path without ".." or other potentially unsafe characters'], { code: 'INVALID_PATH' });
     }
 
     const info = this.readEditorBridgeInfo(resolvePath(args.projectPath));
@@ -3538,7 +3827,8 @@ class GodotServer {
     if (!response.ok) {
       return this.createErrorResponse(
         `Not connected: ${response.error ?? 'unknown error'}`,
-        ['The editor may have closed; its bridge file can be left over from an earlier session', 'Open the project in the Godot editor']
+        ['The editor may have closed; its bridge file can be left over from an earlier session', 'Open the project in the Godot editor'],
+        { code: response.code ?? 'EDITOR_NOT_CONNECTED' }
       );
     }
     return {
@@ -3551,37 +3841,199 @@ class GodotServer {
    */
   private async handleEditorCommand(args: any) {
     if (typeof args?.projectPath !== 'string' || !args.projectPath) {
-      return this.createErrorResponse('Project path is required', ['Provide a valid path to a Godot project directory']);
+      return this.createErrorResponse('Project path is required', ['Provide a valid path to a Godot project directory'], { code: 'INVALID_ARGUMENT' });
     }
     if (!this.validatePath(args.projectPath)) {
-      return this.createErrorResponse('Invalid project path', ['Provide a valid path without ".." or other potentially unsafe characters']);
+      return this.createErrorResponse('Invalid project path', ['Provide a valid path without ".." or other potentially unsafe characters'], { code: 'INVALID_PATH' });
     }
     if (typeof args.command !== 'string' || !EDITOR_BRIDGE_COMMANDS.includes(args.command)) {
       return this.createErrorResponse(
         `Unknown editor command: ${String(args.command)}`,
-        [`Use one of: ${EDITOR_BRIDGE_COMMANDS.join(', ')}`]
+        [`Use one of: ${EDITOR_BRIDGE_COMMANDS.join(', ')}`],
+        { code: 'INVALID_ARGUMENT' }
       );
     }
     const commandArgs: unknown = args.arguments ?? {};
     if (typeof commandArgs !== 'object' || commandArgs === null || Array.isArray(commandArgs)) {
-      return this.createErrorResponse('arguments must be an object', ['Pass the command arguments as an object']);
+      return this.createErrorResponse('arguments must be an object', ['Pass the command arguments as an object'], { code: 'INVALID_ARGUMENT' });
     }
 
     const info = this.readEditorBridgeInfo(resolvePath(args.projectPath));
     if (!info) {
       return this.createErrorResponse(
         'The Godot editor bridge is not running for this project',
-        ['Install it with install_editor_bridge and open the project in the Godot editor']
+        ['Install it with install_editor_bridge and open the project in the Godot editor'],
+        { code: 'EDITOR_NOT_CONNECTED' }
       );
     }
 
     const response = await this.sendEditorRequest(info, args.command, commandArgs as Record<string, unknown>);
     if (!response.ok) {
-      return this.createErrorResponse(response.error ?? 'The editor refused the command', ['Check the arguments with editor_status']);
+      return this.createErrorResponse(
+        response.error ?? 'The editor refused the command',
+        ['Check the arguments with editor_status'],
+        { code: response.code ?? 'EDITOR_REFUSED' }
+      );
     }
     return {
       content: [{ type: 'text', text: JSON.stringify(response.result ?? {}, null, 2) }],
     };
+  }
+
+  /**
+   * Handle the verify_game tool: play a scene with the editor bridge's probe, check that the frame
+   * counter keeps advancing, take a screenshot, collect the runtime errors and stop the game.
+   */
+  private async handleVerifyGame(args: any) {
+    if (typeof args?.projectPath !== 'string' || !args.projectPath) {
+      return this.createErrorResponse('Project path is required', ['Provide a valid path to a Godot project directory'], { code: 'INVALID_ARGUMENT' });
+    }
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse('Invalid project path', ['Provide a valid path without ".." or other potentially unsafe characters'], { code: 'INVALID_PATH' });
+    }
+    if (args.scene !== undefined && (typeof args.scene !== 'string' || args.scene === '')) {
+      return this.createErrorResponse('scene must be a res:// path to a .tscn file', ['Omit scene to run the scene open in the editor'], { code: 'INVALID_ARGUMENT' });
+    }
+    const durationMs: number = typeof args.durationMs === 'number' ? Math.min(Math.max(args.durationMs, 500), 60000) : 3000;
+    const capture: boolean = args.capture !== false;
+
+    const info = this.readEditorBridgeInfo(resolvePath(args.projectPath));
+    if (!info) {
+      return this.createErrorResponse(
+        'The Godot editor bridge is not running for this project',
+        ['Install it with install_editor_bridge and open the project in the Godot editor'],
+        { code: 'EDITOR_NOT_CONNECTED' }
+      );
+    }
+
+    const play = await this.sendEditorRequest(info, 'play', args.scene ? { mode: 'probe', scene: args.scene } : { mode: 'probe' });
+    if (!play.ok) {
+      return this.createErrorResponse(
+        `Could not start the game: ${play.error ?? 'unknown error'}`,
+        ['Save the scene open in the editor, or pass scene'],
+        { code: play.code ?? 'EDITOR_REFUSED' }
+      );
+    }
+    // Only this run's status and screenshots count; a game left running from an earlier run has another session.
+    const session = String(play.result?.session ?? '');
+    if (session === '') {
+      await this.sendEditorRequest(info, 'stop', {});
+      return this.createErrorResponse('The editor bridge did not return a probe session', ['Run install_editor_bridge again so the project has the current bridge']);
+    }
+
+    try {
+      // The probe writes its status when the game starts and at every error; attached is true once the scene is added.
+      const started = await this.waitForProbeStatus(info, session, (s) => s.attached === true || s.load_error !== '' || s.error_count > 0, 15000);
+      if (!started) {
+        return this.createErrorResponse(
+          'The game did not add its scene within 15 seconds',
+          ['It may be frozen while loading, for example in a _ready that never returns'],
+          { code: 'PROBE_NOT_READY' }
+        );
+      }
+      if (started.attached !== true) {
+        // Godot pauses the game at a script error, so the scene never gets added. Report the errors that stopped it.
+        const stopped = (started.errors ?? []).filter((e: any) => e.kind !== 'warning');
+        const reason = started.load_error || (stopped[0]?.message ?? 'unknown error');
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              scene: started.target,
+              advancing: false,
+              reason: `The game stopped before its scene was added: ${reason}`,
+              errorCount: stopped.length,
+              errors: stopped.slice(0, 50),
+            }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      // Sample the frame counter during the window. The game counts as advancing only if the counter
+      // still grows in the last second, so a game that freezes in the middle of the window is reported.
+      const samples: { frames: number; at: number }[] = [];
+      const windowEnd = Date.now() + durationMs;
+      while (Date.now() < windowEnd) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        const now = await this.readProbeStatus(info, session);
+        if (now) {
+          samples.push({ frames: now.frames as number, at: Date.now() });
+        }
+      }
+      const later = (await this.readProbeStatus(info, session)) ?? started;
+      const latest = { frames: later.frames as number, at: Date.now() };
+      const tailStart = latest.at - Math.min(1000, durationMs);
+      const earlier: { frames: number } = [...samples].reverse().find((s) => s.at <= tailStart) ?? samples[0] ?? { frames: started.frames as number };
+      const frames = { first: started.frames as number, second: latest.frames };
+      const advancing = latest.frames > earlier.frames;
+
+      let screenshot: { path: string; data: string } | undefined;
+      let captureError: string | undefined;
+      if (capture) {
+        const id = `verify-${Date.now()}`;
+        const requested = await this.sendEditorRequest(info, 'probe_capture', { id, session });
+        if (!requested.ok) {
+          captureError = requested.error;
+        } else {
+          const shot = await this.waitForProbeStatus(info, session, (s) => s.capture_id === id && (s.capture_path !== '' || s.capture_error !== ''), 5000);
+          if (!shot) {
+            captureError = 'The probe did not answer the screenshot request within 5 seconds';
+          } else if (shot.capture_path !== '') {
+            screenshot = { path: shot.capture_path, data: readFileSync(shot.capture_path).toString('base64') };
+          } else {
+            captureError = shot.capture_error;
+          }
+        }
+      }
+
+      const entries: any[] = later.errors ?? [];
+      const errors = entries.filter((e) => e.kind !== 'warning');
+      const warningCount = entries.length - errors.length;
+      const report = {
+        scene: started.target,
+        advancing,
+        frames,
+        durationMs,
+        errorCount: errors.length,
+        errors: errors.slice(0, 50),
+        warningCount,
+        screenshot: screenshot?.path,
+        captureError,
+      };
+      const content: any[] = [{ type: 'text', text: JSON.stringify(report, null, 2) }];
+      if (screenshot) {
+        content.push({ type: 'image', data: screenshot.data, mimeType: 'image/png' });
+      }
+      return { content, isError: !advancing || errors.length > 0 };
+    } finally {
+      await this.sendEditorRequest(info, 'stop', {});
+    }
+  }
+
+  /** Read the probe's status for one run, or undefined when this run has not reported yet. */
+  private async readProbeStatus(info: { port: number; token: string }, session: string): Promise<any | undefined> {
+    const response = await this.sendEditorRequest(info, 'probe_status', {});
+    const status = response.ok ? response.result?.status : undefined;
+    return status?.session === session ? status : undefined;
+  }
+
+  /** Poll the probe until the predicate holds, or return undefined when the timeout passes. */
+  private async waitForProbeStatus(
+    info: { port: number; token: string },
+    session: string,
+    ready: (status: any) => boolean,
+    timeoutMs: number
+  ): Promise<any | undefined> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const status = await this.readProbeStatus(info, session);
+      if (status && ready(status)) {
+        return status;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    return undefined;
   }
 
   /**
