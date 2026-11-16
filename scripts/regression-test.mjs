@@ -5,7 +5,7 @@
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -249,6 +249,105 @@ async function main() {
 
   const failedParticleRender = await callTool('render_particles', { projectPath: project, scenePath: 'scenes/main.tscn' });
   check('render_particles reports a Godot that failed', failedParticleRender.isError === true && !failedParticleRender.content.some((c) => c.type === 'image'));
+
+  // Recovery tools work on files only, so they run here against a small project with problems on purpose.
+  const rec = mkdtempSync(join(tmpdir(), 'godot-mcp-recovery-'));
+  try {
+    mkdirSync(join(rec, 'scripts'));
+    mkdirSync(join(rec, 'scenes'));
+    mkdirSync(join(rec, 'sprites'));
+    writeFileSync(join(rec, 'project.godot'), ['config_version=5', '', '[application]', '', 'run/main_scene="res://scenes/gone.tscn"', '', '[autoload]', '', 'Globals="*res://scripts/globals.gd"', ''].join('\n'));
+    writeFileSync(join(rec, 'scripts', 'player.gd'), ['extends Node', '', 'func _ready():', '\tvar hero = $Hero', '\thero.visible = true', '', 'func _on_hit():', '\tpass', ''].join('\n'));
+    writeFileSync(join(rec, 'sprites', 'hero.png'), 'png');
+    writeFileSync(join(rec, 'sprites', 'hero.png.import'), ['[remap]', 'uid="uid://hero1"', '[deps]', 'source_file="res://sprites/hero.png"', ''].join('\n'));
+    const levelText = [
+      '[gd_scene load_steps=4 format=3]',
+      '',
+      '[ext_resource type="Script" path="res://scripts/player.gd" id="1"]',
+      '[ext_resource type="Texture2D" path="res://art/hero.png" id="2"]',
+      '[ext_resource type="Texture2D" path="res://gone/x.png" id="3"]',
+      '',
+      '[node name="Level" type="Node2D"]',
+      'script = ExtResource("1")',
+      '',
+      '[node name="Hero" type="Sprite2D" parent="."]',
+      'texture = ExtResource("2")',
+      '',
+      '[node name="Ghost" type="Sprite2D" parent="Nowhere"]',
+      'texture = ExtResource("9")',
+      '',
+      '[connection signal="ready" from="Hero" to="." method="_on_hit"]',
+      '[connection signal="ready" from="Hero" to="." method="_on_missing"]',
+      '[connection signal="ready" from="Hero" to="Nope" method="_on_hit"]',
+      '',
+    ].join('\n');
+    writeFileSync(join(rec, 'scenes', 'level.tscn'), levelText);
+
+    const found = await callTool('validate_project', { projectPath: rec });
+    const text = textOf(found);
+    check('validate_project reports errors', found.isError === true);
+    check('validate_project finds a moved file and says where', text.includes('res://art/hero.png') && text.includes('res://sprites/hero.png'), text.slice(0, 400));
+    check('validate_project finds a file that is gone', text.includes('res://gone/x.png'));
+    check('validate_project finds the missing main scene', text.includes('res://scenes/gone.tscn'));
+    check('validate_project finds the missing autoload', text.includes('res://scripts/globals.gd'));
+    check('validate_project finds an orphan node', text.includes('Ghost'));
+    check('validate_project finds an undeclared id', text.includes('ExtResource("9")'));
+    check('validate_project finds a connection to a missing node', text.includes('Nope'));
+    check('validate_project finds a connection to a missing method', text.includes('_on_missing'));
+    check('validate_project does not flag a method that exists', !text.includes('"_on_hit"') && !text.includes('calls _on_hit'));
+
+    const dry = await callTool('repair_project', { projectPath: rec });
+    check('repair_project reports a fix without changing files', dry.isError !== true && textOf(dry).includes('res://sprites/hero.png') && readFileSync(join(rec, 'scenes', 'level.tscn'), 'utf8') === levelText);
+
+    const first = await callTool('checkpoint', { projectPath: rec, action: 'create', label: 'start' });
+    check('checkpoint create works', first.isError !== true && textOf(first).includes('saved'));
+    const listed = await callTool('checkpoint', { projectPath: rec, action: 'list' });
+    check('checkpoint list shows it', textOf(listed).includes('start'));
+
+    const applied = await callTool('repair_project', { projectPath: rec, apply: true });
+    check('repair_project applies the fix', applied.isError !== true && readFileSync(join(rec, 'scenes', 'level.tscn'), 'utf8').includes('path="res://sprites/hero.png"'));
+    const after = await callTool('validate_project', { projectPath: rec });
+    check('the repaired path is no longer an error', !textOf(after).includes('res://art/hero.png'));
+
+    writeFileSync(join(rec, 'scripts', 'extra.gd'), 'extends Node\n');
+    const difference = await callTool('checkpoint', { projectPath: rec, action: 'diff', id: 'latest' });
+    check('checkpoint diff sees changed and new files', difference.content[0].text.includes('changed') && textOf(difference).includes('extra.gd'), textOf(difference).slice(0, 300));
+
+    const restored = await callTool('checkpoint', { projectPath: rec, action: 'restore', id: first.content[1] ? JSON.parse(first.content[1].text).id : 'latest', deleteNew: true });
+    check('checkpoint restore puts files back', restored.isError !== true && readFileSync(join(rec, 'scenes', 'level.tscn'), 'utf8') === levelText, textOf(restored).slice(0, 300));
+    check('checkpoint restore deletes new files when asked', !existsSync(join(rec, 'scripts', 'extra.gd')));
+    check('checkpoint restore makes an undo checkpoint', /restore \d{8}-\d{6}-[a-z0-9]{3}/.test(restored.content[0].text));
+
+    const unknown = await callTool('checkpoint', { projectPath: rec, action: 'restore', id: '20000101-000000-abc' });
+    check('checkpoint restore rejects an unknown id', unknown.isError === true);
+
+    const plan = await callTool('move_resource', { projectPath: rec, from: 'sprites/hero.png', to: 'art/hero.png', apply: false });
+    check('move_resource can only report', plan.isError !== true && existsSync(join(rec, 'sprites', 'hero.png')) && textOf(plan).includes('Would move'));
+    const moved = await callTool('move_resource', { projectPath: rec, from: 'sprites/hero.png', to: 'art/hero.png' });
+    check('move_resource moves the file and its .import', moved.isError !== true && existsSync(join(rec, 'art', 'hero.png')) && existsSync(join(rec, 'art', 'hero.png.import')) && !existsSync(join(rec, 'sprites', 'hero.png')), textOf(moved).slice(0, 300));
+    check('move_resource updates the .import source_file', readFileSync(join(rec, 'art', 'hero.png.import'), 'utf8').includes('source_file="res://art/hero.png"'));
+    const afterMove = await callTool('validate_project', { projectPath: rec });
+    check('after the move the original path works again', !textOf(afterMove).includes('res://art/hero.png, which'));
+    const occupied = await callTool('move_resource', { projectPath: rec, from: 'art/hero.png', to: 'scripts/player.gd' });
+    check('move_resource refuses an existing target', occupied.isError === true);
+    const outside = await callTool('move_resource', { projectPath: rec, from: 'art/hero.png', to: '../escape.png' });
+    check('move_resource keeps the target inside the project', outside.isError === true);
+
+    const explained = await callTool('explain_error', {
+      projectPath: rec,
+      message: 'SCRIPT ERROR: Invalid access to property or key \'visible\' on a base object of type \'null instance\'.\n   at: _ready (res://scripts/player.gd:5)',
+    });
+    check('explain_error classifies a null instance', textOf(explained).includes('null_instance'));
+    check('explain_error shows the code around the error', textOf(explained).includes('hero.visible = true') && textOf(explained).includes('res://scripts/player.gd'));
+    const hinted = await callTool('explain_error', { projectPath: rec, message: 'Node not found: "Heroe" (relative to "/root/Level").\n   at: _ready (res://scripts/player.gd:4)' });
+    check('explain_error suggests a close node name', textOf(hinted).includes('Hero'), textOf(hinted).slice(0, 400));
+    const unknownError = await callTool('explain_error', { message: 'something strange happened' });
+    check('explain_error admits an unknown message', textOf(unknownError).includes('"category": "unknown"'));
+    const noMessage = await callTool('explain_error', { message: '' });
+    check('explain_error needs a message', noMessage.isError === true);
+  } finally {
+    rmSync(rec, { recursive: true, force: true });
+  }
 }
 
 main()

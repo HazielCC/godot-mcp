@@ -53,6 +53,11 @@ const EXPECTED_TOOLS = [
   'create_particles',
   'tune_particles',
   'render_particles',
+  'checkpoint',
+  'validate_project',
+  'repair_project',
+  'move_resource',
+  'explain_error',
 ];
 
 const TIMEOUT_MS = 15000;

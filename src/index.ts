@@ -15,6 +15,11 @@ import { tmpdir } from 'os';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 
+import {
+  createCheckpoint, deleteCheckpoint, diffCheckpoint, explainError, findCheckpoint, listCheckpoints, moveResource,
+  repairProject, restoreCheckpoint, validateProject,
+} from './recovery.js';
+
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -389,6 +394,7 @@ const PROJECT_PATH_PARAMS: Record<string, string[]> = {
   create_particles: ['scenePath', 'texturePath'],
   tune_particles: ['scenePath', 'texturePath'],
   render_particles: ['scenePath'],
+  move_resource: ['from', 'to'],
 };
 
 
@@ -2002,6 +2008,72 @@ class GodotServer {
             required: ['projectPath', 'scenePath'],
           },
         },
+        {
+          name: 'checkpoint',
+          description: 'Save and restore the state of the project files (scenes, resources, scripts, shaders, project.godot) so a change can be undone. Checkpoints live in .godot/mcp_checkpoints (the newest 20 are kept). Restoring first makes a checkpoint of the current state, so a restore can be undone too. repair_project and move_resource make their own checkpoint before they change anything. Does not need Godot.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              action: { type: 'string', enum: ['create', 'list', 'diff', 'restore', 'delete'], description: 'create saves the files; list shows the checkpoints; diff shows what changed since one; restore puts its files back; delete removes one' },
+              id: { type: 'string', description: 'For diff, restore and delete: a checkpoint id from list, or "latest"' },
+              label: { type: 'string', description: 'For create: a note, such as "before the new level"' },
+              paths: { type: 'array', items: { type: 'string' }, description: 'For create: files or folders to cover, relative to the project. Default: the whole project except addons' },
+              deleteNew: { type: 'boolean', description: 'For restore: also delete the files created since the checkpoint. Default false' },
+            },
+            required: ['projectPath', 'action'],
+          },
+        },
+        {
+          name: 'validate_project',
+          description: 'Check the project files for broken references without running Godot: ext_resource files that do not exist (and where they moved), ids that are not declared, nodes whose parent is missing, duplicate node names, signal connections to nodes or methods that do not exist, autoloads, the main scene and plugins that point to missing files, and preload/load paths in scripts. Every problem has the file, line and a suggestion.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              includeAddons: { type: 'boolean', description: 'Also check the addons folder. Default false' },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'repair_project',
+          description: 'Fix the broken file paths that validate_project can resolve: a file that moved is found by its uid or by being the only file with that name, and the path is updated in scenes, resources, scripts and project.godot. By default it only reports what it would change; pass apply to make the changes, after a checkpoint. Does not need Godot.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              apply: { type: 'boolean', description: 'Make the changes. Default false (only report)' },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'move_resource',
+          description: 'Move or rename a file or folder of the project and update every res:// reference to it in scenes, resources, scripts, shaders, project.godot and settings, together with its .import and .uid files. Makes a checkpoint first. The imported copy is rebuilt the next time the project is imported. Does not need Godot.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              from: { type: 'string', description: 'File or folder to move, relative to the project' },
+              to: { type: 'string', description: 'New path, relative to the project; it must not exist' },
+              apply: { type: 'boolean', description: 'Do the move. Default true; pass false to only list what would change' },
+            },
+            required: ['projectPath', 'from', 'to'],
+          },
+        },
+        {
+          name: 'explain_error',
+          description: 'Explain an error message from Godot or from get_debug_output: what kind of error it is, the usual causes and fixes, the file and line, and the code around that line when a project is given. For a node that was not found it also suggests close node names from the scenes that use the script. Does not need Godot.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              message: { type: 'string', description: 'The error text, including the "at: ... (res://file.gd:12)" lines when there are any' },
+              projectPath: { type: 'string', description: 'Optional project, to show the code around the error' },
+            },
+            required: ['message'],
+          },
+        },
       ],
     }));
 
@@ -2096,6 +2168,16 @@ class GodotServer {
           return await this.handleTuneParticles(request.params.arguments);
         case 'render_particles':
           return await this.handleRenderParticles(request.params.arguments);
+        case 'checkpoint':
+          return await this.handleCheckpoint(request.params.arguments);
+        case 'validate_project':
+          return await this.handleValidateProject(request.params.arguments);
+        case 'repair_project':
+          return await this.handleRepairProject(request.params.arguments);
+        case 'move_resource':
+          return await this.handleMoveResource(request.params.arguments);
+        case 'explain_error':
+          return await this.handleExplainError(request.params.arguments);
         case 'read_scene':
           return await this.handleReadScene(request.params.arguments);
         case 'set_node_property':
@@ -5918,6 +6000,202 @@ class GodotServer {
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
+  }
+
+  /** Check projectPath for the tools that work on files only. Returns the resolved project folder, or an error response. */
+  private checkProjectFolder(args: any): { projectRoot: string } | { error: any } {
+    if (typeof args?.projectPath !== 'string' || !args.projectPath) {
+      return { error: this.createErrorResponse('Project path is required', ['Provide a valid path to a Godot project directory'], { code: 'INVALID_ARGUMENT' }) };
+    }
+    if (!this.validatePath(args.projectPath)) {
+      return { error: this.createErrorResponse('Invalid project path', ['Provide a valid path without ".." segments'], { code: 'INVALID_PATH' }) };
+    }
+    const projectRoot = resolvePath(args.projectPath);
+    if (!existsSync(join(projectRoot, 'project.godot'))) {
+      return { error: this.createErrorResponse(`Not a valid Godot project: ${args.projectPath}`, ['Ensure the path points to a directory containing a project.godot file'], { code: 'PROJECT_NOT_FOUND' }) };
+    }
+    return { projectRoot };
+  }
+
+  private textResult(summary: string, details: unknown, isError = false) {
+    return {
+      content: [
+        { type: 'text', text: summary },
+        { type: 'text', text: JSON.stringify(details, null, 2) },
+      ],
+      isError,
+    };
+  }
+
+  /** Handle the checkpoint tool */
+  private async handleCheckpoint(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    const target = this.checkProjectFolder(args);
+    if ('error' in target) {
+      return target.error;
+    }
+    const root = target.projectRoot;
+    const action = args.action;
+    if (!['create', 'list', 'diff', 'restore', 'delete'].includes(action)) {
+      return this.createErrorResponse('action must be create, list, diff, restore or delete', ['Check action'], { code: 'INVALID_ARGUMENT' });
+    }
+    try {
+      if (action === 'create') {
+        if (args.label !== undefined && (typeof args.label !== 'string' || args.label.length > 200)) {
+          return this.createErrorResponse('label must be text of up to 200 characters', ['Check label'], { code: 'INVALID_ARGUMENT' });
+        }
+        let paths: string[] | undefined;
+        if (args.paths !== undefined) {
+          if (!Array.isArray(args.paths) || args.paths.length > 100 || !args.paths.every((p: unknown) => typeof p === 'string')) {
+            return this.createErrorResponse('paths must be a list of up to 100 paths', ['Check paths'], { code: 'INVALID_ARGUMENT' });
+          }
+          paths = [];
+          for (const value of args.paths as string[]) {
+            const resolved = this.resolveInsideProject(args.projectPath, value);
+            if ('error' in resolved) {
+              return this.createErrorResponse(`paths: ${resolved.error}`, ['Use paths inside the project'], { code: 'INVALID_PATH' });
+            }
+            paths.push(resolved.relPath);
+          }
+        }
+        const manifest = createCheckpoint(root, { label: args.label, paths });
+        return this.textResult(`Checkpoint ${manifest.id} saved: ${manifest.files.length} files${manifest.label ? ` (${manifest.label})` : ''}.`, { id: manifest.id, label: manifest.label, files: manifest.files.length });
+      }
+      if (action === 'list') {
+        const all = listCheckpoints(root);
+        const summary = all.length === 0 ? 'There are no checkpoints.' : all.map((c) => `${c.id}  ${c.files.length} files  ${c.label}`).join('\n');
+        return this.textResult(summary, { checkpoints: all.map((c) => ({ id: c.id, label: c.label, createdAt: c.createdAt, files: c.files.length })) });
+      }
+      if (typeof args.id !== 'string' || args.id === '') {
+        return this.createErrorResponse('id is required (a checkpoint id from list, or "latest")', ['Use action list to see the ids'], { code: 'INVALID_ARGUMENT' });
+      }
+      if (action === 'delete') {
+        return deleteCheckpoint(root, args.id)
+          ? this.textResult(`Checkpoint ${args.id} deleted.`, { deleted: args.id })
+          : this.createErrorResponse(`Checkpoint not found: ${args.id}`, ['Use action list to see the ids'], { code: 'INVALID_ARGUMENT' });
+      }
+      const manifest = findCheckpoint(root, args.id);
+      if (!manifest) {
+        return this.createErrorResponse(`Checkpoint not found: ${args.id}`, ['Use action list to see the ids'], { code: 'INVALID_ARGUMENT' });
+      }
+      if (action === 'diff') {
+        const difference = diffCheckpoint(root, manifest);
+        return this.textResult(
+          `Since ${manifest.id}: ${difference.changed.length} changed, ${difference.removed.length} removed, ${difference.added.length} new, ${difference.unchanged} unchanged.`,
+          difference
+        );
+      }
+      const result = restoreCheckpoint(root, manifest, { deleteNew: args.deleteNew === true });
+      return this.textResult(
+        `Restored ${result.restored.length} file(s) from ${manifest.id}${result.removed.length > 0 ? ` and deleted ${result.removed.length} new file(s)` : ''}. To undo this, restore ${result.undoCheckpoint}.`,
+        result
+      );
+    } catch (error: any) {
+      return this.createErrorResponse(`Checkpoint failed: ${error?.message || 'Unknown error'}`, ['Check that the project folder is writable']);
+    }
+  }
+
+  /** Handle the validate_project tool */
+  private async handleValidateProject(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    const target = this.checkProjectFolder(args);
+    if ('error' in target) {
+      return target.error;
+    }
+    try {
+      const result = validateProject(target.projectRoot, { includeAddons: args.includeAddons === true });
+      const shown = result.issues.filter((i) => i.severity !== 'info').slice(0, 15).map((i) => `- [${i.severity}] ${i.file}${i.line ? `:${i.line}` : ''}: ${i.message}${i.suggestion ? `. ${i.suggestion}` : ''}`);
+      const summary = [`Checked ${result.filesChecked} files: ${result.counts.error} error(s), ${result.counts.warning} warning(s), ${result.counts.info} info.`, ...shown].join('\n');
+      return this.textResult(summary, { counts: result.counts, filesChecked: result.filesChecked, issues: result.issues.slice(0, 300), issuesOmitted: Math.max(0, result.issues.length - 300) }, result.counts.error > 0);
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to check the project: ${error?.message || 'Unknown error'}`, ['Check that the project folder is readable']);
+    }
+  }
+
+  /** Handle the repair_project tool */
+  private async handleRepairProject(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    const target = this.checkProjectFolder(args);
+    if ('error' in target) {
+      return target.error;
+    }
+    if (args.apply !== undefined && typeof args.apply !== 'boolean') {
+      return this.createErrorResponse('apply must be true or false', ['Check apply'], { code: 'INVALID_ARGUMENT' });
+    }
+    try {
+      const apply = args.apply === true;
+      const result = repairProject(target.projectRoot, { apply });
+      const lines = result.changes.map((c) => `- ${c.file}: ${c.from} -> ${c.to}${c.occurrences > 1 ? ` (x${c.occurrences})` : ''}`);
+      const summary = [
+        result.changes.length === 0 ? 'No path can be repaired automatically.' : `${apply ? 'Changed' : 'Would change'} ${result.changes.length} path(s):`,
+        ...lines,
+        ...(result.unresolved.length > 0 ? ['', `${result.unresolved.length} missing file(s) could not be resolved (use validate_project for the list).`] : []),
+        ...(result.checkpoint ? ['', `Checkpoint ${result.checkpoint} was made first; restore it to undo.`] : []),
+        ...(!apply && result.changes.length > 0 ? ['', 'Run again with apply set to true to make the changes.'] : []),
+      ].join('\n');
+      return this.textResult(summary, { applied: apply, ...result, unresolved: result.unresolved.slice(0, 100) });
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to repair the project: ${error?.message || 'Unknown error'}`, ['Check that the project folder is writable']);
+    }
+  }
+
+  /** Handle the move_resource tool */
+  private async handleMoveResource(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    const target = this.checkProjectFolder(args);
+    if ('error' in target) {
+      return target.error;
+    }
+    for (const key of ['from', 'to']) {
+      if (typeof args[key] !== 'string' || args[key] === '') {
+        return this.createErrorResponse(`${key} is required and must be text`, [`Provide ${key}`], { code: 'INVALID_ARGUMENT' });
+      }
+    }
+    if (args.apply !== undefined && typeof args.apply !== 'boolean') {
+      return this.createErrorResponse('apply must be true or false', ['Check apply'], { code: 'INVALID_ARGUMENT' });
+    }
+    try {
+      const apply = args.apply !== false;
+      const result = moveResource(target.projectRoot, args.from, args.to, { apply });
+      const total = result.updates.reduce((sum, u) => sum + u.occurrences, 0);
+      const summary = [
+        `${apply ? 'Moved' : 'Would move'} ${args.from} to ${args.to}${result.moved.length > 1 ? ` (with ${result.moved.slice(1).join(', ')})` : ''}.`,
+        `${apply ? 'Updated' : 'Would update'} ${total} reference(s) in ${result.updates.length} file(s).`,
+        ...(result.checkpoint ? [`Checkpoint ${result.checkpoint} was made first; restore it to undo.`] : []),
+      ].join('\n');
+      return this.textResult(summary, { applied: apply, ...result });
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to move: ${error?.message || 'Unknown error'}`, ['Check that both paths are inside the project and that the target does not exist']);
+    }
+  }
+
+  /** Handle the explain_error tool */
+  private async handleExplainError(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    if (typeof args.message !== 'string' || args.message.trim() === '' || args.message.length > 20000) {
+      return this.createErrorResponse('message is required: the error text, up to 20000 characters', ['Paste the error from get_debug_output or the Godot console'], { code: 'INVALID_ARGUMENT' });
+    }
+    let projectRoot: string | undefined;
+    if (args.projectPath !== undefined) {
+      const target = this.checkProjectFolder(args);
+      if ('error' in target) {
+        return target.error;
+      }
+      projectRoot = target.projectRoot;
+    }
+    const explanation = explainError(args.message, projectRoot);
+    const where = explanation.locations.length > 0 ? ` at ${explanation.locations[0].file}:${explanation.locations[0].line}` : '';
+    const context = explanation.context ? ['', ...explanation.context.lines.map((l) => `${l.here ? '>' : ' '} ${String(l.number).padStart(4)} | ${l.text}`)] : [];
+    const summary = [
+      `${explanation.title}${where}`,
+      explanation.explanation,
+      '',
+      'What to try:',
+      ...explanation.fixes.map((f) => `- ${f}`),
+      ...(explanation.hints.length > 0 ? ['', ...explanation.hints] : []),
+      ...context,
+    ].join('\n');
+    return this.textResult(summary, explanation);
   }
 
   /**

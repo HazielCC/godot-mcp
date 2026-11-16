@@ -237,6 +237,18 @@ These work in 2D and 3D and need Godot 4.3 or later. `create_particles` and `tun
 
 Presets are written in meters. In 2D, lengths, speeds and gravity are multiplied by 64 (pixels per meter) and +Y is still "up" in `direction` and `gravity`.
 
+### Recovery tools
+
+None of these needs Godot: they read and write the project's text files.
+
+| Tool | What it does |
+|------|--------------|
+| `checkpoint` | Saves and restores the project files (scenes, resources, scripts, shaders, `project.godot`) in `.godot/mcp_checkpoints`. Actions: `create`, `list`, `diff` (what changed since one), `restore` (optionally `deleteNew`) and `delete`. Restoring first saves the current state, so a restore can be undone. The newest 20 are kept |
+| `validate_project` | Finds broken references without running the project: `ext_resource` files that do not exist (and where they moved, by uid or by name), ids that are not declared, orphan and duplicate nodes, signal connections to nodes or `_on_*` methods that do not exist, autoloads, main scene and plugins that point to missing files, and `preload`/`load` paths in scripts |
+| `repair_project` | Fixes the paths of files that moved, in scenes, resources, scripts and `project.godot`. It only reports unless `apply` is true, and makes a checkpoint before changing anything |
+| `move_resource` | Moves or renames a file or folder and updates every `res://` reference to it, with its `.import` and `.uid` files. Makes a checkpoint first; `apply: false` only lists what would change |
+| `explain_error` | Explains an error message (what it means, usual causes and fixes, the file and line) and, with `projectPath`, shows the code around the error. For a node that was not found it suggests close node names from the scenes that use the script |
+
 ## Building from source
 
 Use this if you want to modify the server or run a local copy:
