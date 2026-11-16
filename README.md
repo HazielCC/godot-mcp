@@ -210,6 +210,21 @@ These need Godot 4.3 or later. Like the 2D tools, they do not edit scenes that i
 
 To try them, run `node scripts/fixtures/make-3d-fixture.mjs`. It writes a small project with a brick texture folder, a crate model and a scene with a floor, and prints its path.
 
+### UI tools
+
+These need Godot 4.3 or later. `build_ui` and `make_theme` work headless. The four tools that draw or measure (`render_scene_ui`, `ui_lint`, `ui_check_focus`, `ui_check_contrast`) open a short-lived Godot window, so they need a display and a graphics driver; each screen size is drawn in its own `SubViewport`, so a size larger than your screen works.
+
+| Tool | What it does |
+|------|--------------|
+| `build_ui` | Builds a tree of `Control` nodes from a JSON spec, `{type, name, props, children}`, and adds it to a scene (or creates the scene). Besides any property of the node, `props` has shortcuts: `anchors` (a preset such as `full_rect` or `center`), `margins`, `separation`, `size_flags_horizontal`/`size_flags_vertical`, `theme_constants`, `theme_colors`, `theme_font_sizes`. Enum names, `"#rrggbb"` colors and `[x, y]` vectors are accepted, and every value is read back to check it took |
+| `make_theme` | Creates a `Theme` (`.tres`) from a palette: button states, the variations `PrimaryButton`, `AccentButton` and `DangerButton`, panels, labels, text fields, check boxes and progress bars. Text colors are picked for contrast. Can set it on a node |
+| `render_scene_ui` | Draws a scene at several sizes (`small`, `phone`, `tablet`, `hd`, `fhd`, `4k` or `WIDTHxHEIGHT`) and returns one PNG per size |
+| `ui_lint` | Finds layout problems per size: controls outside or sticking out of the screen, text cut off, controls that overflow their parent, touch targets under 44 px, panels that block clicks on a button, overlapping labels. Each problem has the node path, a severity and a suggestion. `pseudoLocalize` makes the texts about 40 % longer to test other languages |
+| `ui_check_focus` | Checks keyboard and gamepad use: lists the focusable controls, follows the arrow keys and Tab from the first one, and reports unreachable controls, dead ends, focus neighbors that do not exist, an empty focus style and a screen that opens without focus |
+| `ui_check_contrast` | Measures the contrast of every text against the background that is actually drawn behind it (WCAG 4.5:1, or 3:1 for large text) and suggests a color that passes |
+
+To try them, run `node scripts/fixtures/make-ui-fixture.mjs`. It writes a project with a menu that has defects on purpose (`scenes/broken.tscn`), and prints its path.
+
 ## Building from source
 
 Use this if you want to modify the server or run a local copy:

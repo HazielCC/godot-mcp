@@ -93,6 +93,10 @@ func _init() -> void:
             create_pbr_material(params)
         "extract_mesh":
             extract_mesh(params)
+        "build_ui":
+            build_ui(params)
+        "make_theme":
+            make_theme(params)
         "bake_navmesh":
             # Reading geometry needs the scene inside a running tree, which only exists after _init.
             _deferred_params = params
@@ -1198,6 +1202,10 @@ func values_match(actual: Variant, expected: Variant) -> bool:
     var actual_kind: int = typeof(actual)
     if expected_kind == TYPE_FLOAT or expected_kind == TYPE_INT:
         return (actual_kind == TYPE_FLOAT or actual_kind == TYPE_INT) and absf(float(actual) - float(expected)) < 0.0001
+    # Godot reads some String properties back as a StringName.
+    var texts: Array = [TYPE_STRING, TYPE_STRING_NAME]
+    if texts.has(expected_kind) and texts.has(actual_kind):
+        return str(actual) == str(expected)
     if actual_kind != expected_kind:
         return false
     if expected_kind == TYPE_VECTOR2:
@@ -2278,3 +2286,363 @@ func extract_mesh(params: Dictionary) -> void:
         _fail(what + ": could not save " + output_path + ", error " + str(save_error))
         return
     _result({"output": output_path, "surfaces": surfaces, "vertices": vertices})
+
+
+# ---------------------------------------------------------------------------
+# UI tools: build_ui, make_theme.
+# ---------------------------------------------------------------------------
+
+const ANCHOR_PRESETS: Dictionary = {
+    "top_left": Control.PRESET_TOP_LEFT,
+    "top_right": Control.PRESET_TOP_RIGHT,
+    "bottom_left": Control.PRESET_BOTTOM_LEFT,
+    "bottom_right": Control.PRESET_BOTTOM_RIGHT,
+    "center_left": Control.PRESET_CENTER_LEFT,
+    "center_top": Control.PRESET_CENTER_TOP,
+    "center_right": Control.PRESET_CENTER_RIGHT,
+    "center_bottom": Control.PRESET_CENTER_BOTTOM,
+    "center": Control.PRESET_CENTER,
+    "left_wide": Control.PRESET_LEFT_WIDE,
+    "top_wide": Control.PRESET_TOP_WIDE,
+    "right_wide": Control.PRESET_RIGHT_WIDE,
+    "bottom_wide": Control.PRESET_BOTTOM_WIDE,
+    "vcenter_wide": Control.PRESET_VCENTER_WIDE,
+    "hcenter_wide": Control.PRESET_HCENTER_WIDE,
+    "full_rect": Control.PRESET_FULL_RECT,
+}
+
+const SIZE_FLAG_NAMES: Dictionary = {
+    "fill": Control.SIZE_FILL,
+    "expand": Control.SIZE_EXPAND,
+    "expand_fill": Control.SIZE_EXPAND_FILL,
+    "shrink_begin": Control.SIZE_SHRINK_BEGIN,
+    "shrink_center": Control.SIZE_SHRINK_CENTER,
+    "shrink_end": Control.SIZE_SHRINK_END,
+}
+
+# Offsets of one axis for a preset: a point anchor places the control by its size, a wide one stretches it.
+func _preset_offsets(anchor_begin: float, anchor_end: float, length: float) -> Array:
+    if not is_equal_approx(anchor_begin, anchor_end):
+        return [0.0, 0.0]
+    return [-length * anchor_begin, length * (1.0 - anchor_begin)]
+
+func _grow_for(anchor_begin: float, anchor_end: float) -> int:
+    if not is_equal_approx(anchor_begin, anchor_end):
+        return Control.GROW_DIRECTION_END
+    if is_equal_approx(anchor_begin, 0.5):
+        return Control.GROW_DIRECTION_BOTH
+    return Control.GROW_DIRECTION_BEGIN if anchor_begin > 0.5 else Control.GROW_DIRECTION_END
+
+# set_anchors_and_offsets_preset needs the parent's size, which a scene that is not open does not have,
+# so the offsets are worked out here from the control's minimum size.
+func _apply_anchor_preset(control: Control, preset_name: String) -> bool:
+    if not ANCHOR_PRESETS.has(preset_name):
+        return false
+    control.set_anchors_preset(ANCHOR_PRESETS[preset_name] as int)
+    var minimum: Vector2 = control.custom_minimum_size.max(control.get_minimum_size())
+    var horizontal: Array = _preset_offsets(control.anchor_left, control.anchor_right, minimum.x)
+    var vertical: Array = _preset_offsets(control.anchor_top, control.anchor_bottom, minimum.y)
+    control.offset_left = horizontal[0]
+    control.offset_right = horizontal[1]
+    control.offset_top = vertical[0]
+    control.offset_bottom = vertical[1]
+    control.grow_horizontal = _grow_for(control.anchor_left, control.anchor_right) as Control.GrowDirection
+    control.grow_vertical = _grow_for(control.anchor_top, control.anchor_bottom) as Control.GrowDirection
+    return true
+
+func _ui_property_info(node: Object, property_name: String) -> Dictionary:
+    for info: Dictionary in node.get_property_list():
+        if str(info.name) == property_name:
+            return info
+    return {}
+
+# Turns a JSON value into the value a property takes: enum names, #hex colors, [x, y] vectors, res:// paths and
+# Godot literals. Returns {ok, value, error}.
+func _ui_value(info: Dictionary, value: Variant) -> Dictionary:
+    var type: int = int(info.type)
+    if typeof(value) == TYPE_STRING:
+        var text: String = value
+        if type == TYPE_INT and int(info.hint) == PROPERTY_HINT_ENUM:
+            var options: PackedStringArray = str(info.hint_string).split(",")
+            for index: int in range(options.size()):
+                var parts: PackedStringArray = options[index].split(":")
+                if parts[0].strip_edges().to_lower().replace(" ", "_") == text.to_lower().replace(" ", "_"):
+                    return {"ok": true, "value": int(parts[1]) if parts.size() > 1 else index, "error": ""}
+            return {"ok": false, "value": null, "error": "'" + text + "' is not one of: " + str(info.hint_string)}
+        if type == TYPE_COLOR and Color.html_is_valid(text):
+            return {"ok": true, "value": Color.html(text), "error": ""}
+        if type == TYPE_STRING_NAME:
+            return {"ok": true, "value": StringName(text), "error": ""}
+        if type == TYPE_NODE_PATH:
+            return {"ok": true, "value": NodePath(text), "error": ""}
+    if typeof(value) == TYPE_ARRAY:
+        var items: Array = value
+        if type == TYPE_VECTOR2 and items.size() == 2:
+            return {"ok": true, "value": Vector2(float(items[0]), float(items[1])), "error": ""}
+        if type == TYPE_VECTOR2I and items.size() == 2:
+            return {"ok": true, "value": Vector2i(int(items[0]), int(items[1])), "error": ""}
+        if type == TYPE_COLOR and (items.size() == 3 or items.size() == 4):
+            return {"ok": true, "value": Color(float(items[0]), float(items[1]), float(items[2]), float(items[3]) if items.size() == 4 else 1.0), "error": ""}
+        if type == TYPE_RECT2 and items.size() == 4:
+            return {"ok": true, "value": Rect2(float(items[0]), float(items[1]), float(items[2]), float(items[3])), "error": ""}
+    if typeof(value) == TYPE_FLOAT and type == TYPE_INT:
+        return {"ok": true, "value": int(value), "error": ""}
+    return convert_property_value(type, value)
+
+# Applies the props of one node of a UI spec. Returns an error message, or "" when all went well.
+func _apply_ui_props(node: Control, props: Dictionary, warnings: Array) -> String:
+    for key: String in props:
+        var value: Variant = props[key]
+        match key:
+            "script":
+                return "script cannot be set from a UI spec"
+            "anchors":
+                if not _apply_anchor_preset(node, str(value)):
+                    return "anchors must be one of: " + ", ".join(ANCHOR_PRESETS.keys())
+                if node.get_parent() is Container:
+                    warnings.append(str(node.name) + ": anchors are ignored inside a container; its parent places it")
+            "margins":
+                if not (node is MarginContainer):
+                    return "margins only applies to a MarginContainer"
+                var sides: Dictionary = {}
+                if typeof(value) == TYPE_DICTIONARY:
+                    sides = value
+                else:
+                    sides = {"left": value, "top": value, "right": value, "bottom": value}
+                for side: String in sides:
+                    if not (side in ["left", "top", "right", "bottom"]):
+                        return "margins accepts left, top, right and bottom"
+                    node.add_theme_constant_override("margin_" + side, int(sides[side]))
+            "separation":
+                node.add_theme_constant_override("separation", int(value))
+            "size_flags_horizontal", "size_flags_vertical":
+                var flags: int = 0
+                if typeof(value) == TYPE_STRING:
+                    if not SIZE_FLAG_NAMES.has(str(value)):
+                        return key + " must be one of: " + ", ".join(SIZE_FLAG_NAMES.keys())
+                    flags = SIZE_FLAG_NAMES[str(value)]
+                else:
+                    flags = int(value)
+                node.set(key, flags)
+            "theme_constants":
+                for constant_name: String in (value as Dictionary):
+                    node.add_theme_constant_override(constant_name, int((value as Dictionary)[constant_name]))
+            "theme_font_sizes":
+                for size_name: String in (value as Dictionary):
+                    node.add_theme_font_size_override(size_name, int((value as Dictionary)[size_name]))
+            "theme_colors":
+                for color_name: String in (value as Dictionary):
+                    var color_text: String = str((value as Dictionary)[color_name])
+                    if not Color.html_is_valid(color_text):
+                        return "theme_colors." + color_name + " must be a color like #ffffff"
+                    node.add_theme_color_override(color_name, Color.html(color_text))
+            _:
+                var info: Dictionary = _ui_property_info(node, key)
+                if info.is_empty():
+                    return str(node.get_class()) + " has no property " + key
+                var converted: Dictionary = _ui_value(info, value)
+                if not converted.ok:
+                    return key + ": " + str(converted.error)
+                node.set(key, converted.value)
+                if not values_match(node.get(key), converted.value):
+                    return key + " did not take the value " + var_to_str(converted.value)
+    return ""
+
+func _set_owner_recursive(node: Node, owner_node: Node) -> void:
+    node.owner = owner_node
+    for child: Node in node.get_children():
+        _set_owner_recursive(child, owner_node)
+
+# Builds one node of a UI spec ({type, name, props, children}) and, recursively, its children. Returns null
+# after reporting the failure.
+func _build_ui_node(spec: Dictionary, parent: Node, warnings: Array, counter: Array) -> Control:
+    var type_name: String = str(spec.get("type", ""))
+    if not ClassDB.class_exists(type_name) or not ClassDB.can_instantiate(type_name) or not ClassDB.is_parent_class(type_name, "Control"):
+        _fail("build ui: " + type_name + " is not a Control class that can be created")
+        return null
+    var node_name: String = str(spec.get("name", type_name))
+    if parent != null and parent.get_node_or_null(node_name) != null:
+        _fail("build ui: " + str(parent.name) + " already has a child named " + node_name)
+        return null
+    var node: Control = ClassDB.instantiate(type_name) as Control
+    node.name = node_name
+    if parent != null:
+        parent.add_child(node)
+    var props: Dictionary = spec.get("props", {}) as Dictionary
+    var problem: String = _apply_ui_props(node, props, warnings)
+    if problem != "":
+        _fail("build ui: " + node_name + " (" + type_name + "): " + problem)
+        return null
+    counter[0] = int(counter[0]) + 1
+    for child_spec: Variant in spec.get("children", []):
+        if _build_ui_node(child_spec as Dictionary, node, warnings, counter) == null:
+            return null
+    return node
+
+# Builds a tree of Control nodes from a JSON spec. When the scene exists the tree is added under a parent node;
+# when it does not, the spec's root becomes the root of a new scene.
+func build_ui(params: Dictionary) -> void:
+    var what: String = "build ui"
+    var spec: Dictionary = params.tree
+    var scene_path: String = str(params.scene_path)
+    var creating: bool = not FileAccess.file_exists(_res_path(scene_path))
+    var warnings: Array = []
+    var counter: Array = [0]
+    var scene_root: Node = null
+    var built: Control = null
+    if creating:
+        built = _build_ui_node(spec, null, warnings, counter)
+        if built == null:
+            return
+        scene_root = built
+        for child: Node in built.get_children():
+            _set_owner_recursive(child, built)
+        _make_parent_dir(_res_path(scene_path))
+    else:
+        scene_root = _open_scene_root(scene_path, what)
+        if scene_root == null:
+            return
+        var parent: Node = _resolve_parent(scene_root, params)
+        if parent == null:
+            _fail(what + ": parent node not found: " + str(params.get("parent_node_path", "")))
+            scene_root.free()
+            return
+        built = _build_ui_node(spec, parent, warnings, counter)
+        if built == null:
+            scene_root.free()
+            return
+        _set_owner_recursive(built, scene_root)
+    if not _save_scene_root(scene_root, scene_path, what):
+        scene_root.free()
+        return
+    var root_name: String = str(scene_root.name)
+    var built_path: String = root_name if built == scene_root else root_name + "/" + str(scene_root.get_path_to(built))
+    scene_root.free()
+    _result({"root": built_path, "nodes": int(counter[0]), "created_scene": creating, "warnings": warnings})
+
+# --- themes
+
+func _ui_color(value: Variant, fallback: Color) -> Color:
+    if typeof(value) == TYPE_STRING and Color.html_is_valid(str(value)):
+        return Color.html(str(value))
+    return fallback
+
+func _luminance(color: Color) -> float:
+    var linear: Array = []
+    for channel: float in [color.r, color.g, color.b]:
+        linear.append(channel / 12.92 if channel <= 0.03928 else pow((channel + 0.055) / 1.055, 2.4))
+    return 0.2126 * float(linear[0]) + 0.7152 * float(linear[1]) + 0.0722 * float(linear[2])
+
+func _contrast_ratio(first: Color, second: Color) -> float:
+    var a: float = _luminance(first)
+    var b: float = _luminance(second)
+    return (maxf(a, b) + 0.05) / (minf(a, b) + 0.05)
+
+func _best_text_on(background: Color) -> Color:
+    return Color.WHITE if _contrast_ratio(Color.WHITE, background) >= _contrast_ratio(Color.BLACK, background) else Color.BLACK
+
+func _flat_box(fill: Color, border: Color, radius: int, border_width: int, padding: int) -> StyleBoxFlat:
+    var box: StyleBoxFlat = StyleBoxFlat.new()
+    box.bg_color = fill
+    box.border_color = border
+    box.set_border_width_all(border_width)
+    box.set_corner_radius_all(radius)
+    box.set_content_margin_all(float(padding))
+    return box
+
+func _style_button_type(theme: Theme, type_name: String, normal: Color, hover: Color, pressed: Color, border: Color, focus: Color, radius: int, border_width: int, padding: int) -> void:
+    theme.set_stylebox("normal", type_name, _flat_box(normal, border, radius, border_width, padding))
+    theme.set_stylebox("hover", type_name, _flat_box(hover, border, radius, border_width, padding))
+    theme.set_stylebox("pressed", type_name, _flat_box(pressed, border, radius, border_width, padding))
+    theme.set_stylebox("disabled", type_name, _flat_box(Color(normal.r, normal.g, normal.b, 0.5), border, radius, border_width, padding))
+    var ring: StyleBoxFlat = _flat_box(Color(0, 0, 0, 0), focus, radius, 2, padding)
+    ring.draw_center = false
+    theme.set_stylebox("focus", type_name, ring)
+    var text_normal: Color = _best_text_on(normal)
+    theme.set_color("font_color", type_name, text_normal)
+    theme.set_color("font_hover_color", type_name, _best_text_on(hover))
+    theme.set_color("font_pressed_color", type_name, _best_text_on(pressed))
+    theme.set_color("font_focus_color", type_name, text_normal)
+    theme.set_color("font_disabled_color", type_name, Color(text_normal.r, text_normal.g, text_normal.b, 0.5))
+
+# A Theme (.tres) from a palette: button states and variations, panels, labels, text fields and progress bars.
+func make_theme(params: Dictionary) -> void:
+    var what: String = "make theme"
+    var output_path: String = _res_path(str(params.output_path))
+    var palette: Dictionary = params.get("palette", {}) as Dictionary
+    var background: Color = _ui_color(palette.get("background"), Color("#1e1f26"))
+    var text: Color = _ui_color(palette.get("text"), Color("#e8e8ea"))
+    var primary: Color = _ui_color(palette.get("primary"), Color("#4f8cff"))
+    var accent: Color = _ui_color(palette.get("accent"), Color("#ffb454"))
+    var danger: Color = _ui_color(palette.get("danger"), Color("#e5484d"))
+    var radius: int = int(params.get("radius", 6))
+    var border_width: int = int(params.get("border_width", 1))
+    var padding: int = int(params.get("padding", 10))
+    var surface: Color = background.lerp(text, 0.08)
+    var surface_hover: Color = background.lerp(text, 0.16)
+    var surface_pressed: Color = background.lerp(text, 0.04)
+    var border: Color = background.lerp(text, 0.28)
+
+    var theme: Theme = Theme.new()
+    theme.default_font_size = int(params.get("font_size", 16))
+    if params.has("font_path"):
+        var font: Font = load(_res_path(str(params.font_path))) as Font
+        if font == null:
+            _fail(what + ": could not load the font " + str(params.font_path))
+            return
+        theme.default_font = font
+
+    var styled: Array = ["Button", "OptionButton", "PrimaryButton", "AccentButton", "DangerButton", "Panel", "PanelContainer", "Label", "LineEdit", "ProgressBar", "CheckBox", "CheckButton"]
+    for type_name: String in ["Button", "OptionButton"]:
+        _style_button_type(theme, type_name, surface, surface_hover, surface_pressed, border, primary, radius, border_width, padding)
+    for variation: Array in [["PrimaryButton", primary], ["AccentButton", accent], ["DangerButton", danger]]:
+        var variation_name: String = variation[0]
+        var base: Color = variation[1]
+        theme.set_type_variation(variation_name, "Button")
+        _style_button_type(theme, variation_name, base, base.lightened(0.12), base.darkened(0.15), base, text, radius, 0, padding)
+
+    theme.set_stylebox("panel", "Panel", _flat_box(background, border, radius, border_width, padding))
+    theme.set_stylebox("panel", "PanelContainer", _flat_box(surface, border, radius, border_width, padding))
+    theme.set_color("font_color", "Label", text)
+    for type_name: String in ["CheckBox", "CheckButton"]:
+        theme.set_color("font_color", type_name, text)
+        theme.set_color("font_hover_color", type_name, text)
+        theme.set_color("font_pressed_color", type_name, text)
+        theme.set_color("font_focus_color", type_name, text)
+        theme.set_color("font_disabled_color", type_name, Color(text.r, text.g, text.b, 0.5))
+
+    var field: Color = background.darkened(0.15)
+    theme.set_stylebox("normal", "LineEdit", _flat_box(field, border, radius, border_width, padding))
+    theme.set_stylebox("read_only", "LineEdit", _flat_box(surface, border, radius, border_width, padding))
+    theme.set_stylebox("focus", "LineEdit", _flat_box(field, primary, radius, 2, padding))
+    theme.set_color("font_color", "LineEdit", text)
+    theme.set_color("font_placeholder_color", "LineEdit", Color(text.r, text.g, text.b, 0.6))
+    theme.set_color("caret_color", "LineEdit", primary)
+    theme.set_color("selection_color", "LineEdit", Color(primary.r, primary.g, primary.b, 0.45))
+    theme.set_stylebox("background", "ProgressBar", _flat_box(surface, border, radius, border_width, 4))
+    theme.set_stylebox("fill", "ProgressBar", _flat_box(primary, primary, radius, 0, 4))
+    theme.set_color("font_color", "ProgressBar", _best_text_on(primary))
+
+    _make_parent_dir(output_path)
+    var save_error: Error = ResourceSaver.save(theme, output_path)
+    if save_error != OK:
+        _fail(what + ": could not save " + output_path + ", error " + str(save_error))
+        return
+
+    var assigned: String = ""
+    if params.has("scene_path"):
+        var scene_root: Node = _open_scene_root(str(params.scene_path), what)
+        if scene_root == null:
+            return
+        var target: Control = _find_node(scene_root, str(scene_root.name), str(params.get("node_path", ""))) as Control
+        if target == null:
+            _fail(what + ": " + str(params.get("node_path", "")) + " is not a Control in the scene")
+            scene_root.free()
+            return
+        target.theme = ResourceLoader.load(output_path, "Theme", ResourceLoader.CACHE_MODE_REPLACE) as Theme
+        if not _save_scene_root(scene_root, str(params.scene_path), what):
+            scene_root.free()
+            return
+        assigned = str(params.node_path)
+        scene_root.free()
+    _result({"output": output_path, "types": styled, "assigned_to": assigned})
