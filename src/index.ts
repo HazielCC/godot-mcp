@@ -86,7 +86,7 @@ type TestState = { directory: string; savedAt: string; tests: TestRecord[] };
  */
 const REPACKING_OPERATIONS = [
   'add_node', 'load_sprite', 'set_node_property', 'save_scene', 'import_spritesheet', 'auto_collision',
-  'build_tilemap', 'setup_parallax_2d', 'build_blockout', 'create_pbr_material', 'bake_navmesh',
+  'build_tilemap', 'setup_parallax_2d', 'build_blockout', 'create_pbr_material', 'bake_navmesh', 'build_ui', 'make_theme',
 ];
 
 /** The buffer line of each MultiMesh in a scene text, by the key of the node that uses it. */
@@ -380,6 +380,12 @@ const PROJECT_PATH_PARAMS: Record<string, string[]> = {
   scatter_multimesh: ['scenePath', 'meshPath'],
   bake_navmesh: ['scenePath'],
   render_scene_3d: ['scenePath'],
+  build_ui: ['scenePath'],
+  make_theme: ['outputPath', 'scenePath', 'fontPath'],
+  render_scene_ui: ['scenePath'],
+  ui_lint: ['scenePath'],
+  ui_check_focus: ['scenePath'],
+  ui_check_contrast: ['scenePath'],
 };
 
 
@@ -432,6 +438,8 @@ class GodotServer {
   private checkScriptsPath: string;
   private renderScenePath: string;
   private renderScene3dPath: string;
+  private renderSceneUiPath: string;
+  private inspectUiPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
   private godotDebugMode: boolean = GODOT_DEBUG_MODE;
@@ -502,6 +510,8 @@ class GodotServer {
     this.checkScriptsPath = join(__dirname, 'scripts', 'check_scripts.gd');
     this.renderScenePath = join(__dirname, 'scripts', 'render_scene.gd');
     this.renderScene3dPath = join(__dirname, 'scripts', 'render_scene_3d.gd');
+    this.renderSceneUiPath = join(__dirname, 'scripts', 'render_scene_ui.gd');
+    this.inspectUiPath = join(__dirname, 'scripts', 'inspect_ui.gd');
     if (debugMode) console.error(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
 
     // Initialize the MCP server
@@ -1810,6 +1820,95 @@ class GodotServer {
             required: ['projectPath', 'scenePath'],
           },
         },
+        {
+          name: 'build_ui',
+          description: 'Build a tree of Control nodes from a JSON spec and add it to a scene, or create the scene when it does not exist (the spec root becomes its root). Every node is {type, name, props, children}. props are properties of the node (text, custom_minimum_size [x, y], horizontal_alignment "center", ...) plus shortcuts: anchors (a preset such as full_rect, center, top_wide), margins (a number, or {left, top, right, bottom}, for MarginContainer), separation, size_flags_horizontal / size_flags_vertical (fill, expand, expand_fill, shrink_begin, shrink_center, shrink_end), theme_constants, theme_colors, theme_font_sizes. Colors are "#rrggbb" and vectors are [x, y]. Anchors are ignored inside containers.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project, ending in .tscn. Created when it does not exist (it must not inherit from another scene)' },
+              tree: { type: 'object', description: 'The root node of the UI: {"type": "VBoxContainer", "name": "Menu", "props": {"anchors": "center", "separation": 12}, "children": [{"type": "Label", "props": {"text": "Title"}}, {"type": "Button", "name": "Play", "props": {"text": "Play"}}]}. Up to 12 levels and 500 nodes' },
+              parentNodePath: { type: 'string', description: 'When the scene exists: parent of the tree, such as "Main" or "Main/Hud". Default: the scene root' },
+            },
+            required: ['projectPath', 'scenePath', 'tree'],
+          },
+        },
+        {
+          name: 'make_theme',
+          description: 'Create a Theme (.tres) from a palette: states of Button (normal, hover, pressed, disabled, focus), the type variations PrimaryButton, AccentButton and DangerButton, Panel, PanelContainer, Label, LineEdit, CheckBox, CheckButton, OptionButton and ProgressBar. Text colors are chosen for contrast. Optionally set it as the theme of a node.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              outputPath: { type: 'string', description: 'Where to save the theme, relative to the project, ending in .tres' },
+              palette: { type: 'object', description: 'Colors as "#rrggbb": background, text, primary, accent, danger. Defaults: a dark theme with a blue primary' },
+              radius: { type: 'number', description: 'Corner radius in pixels. Default 6' },
+              borderWidth: { type: 'number', description: 'Border width in pixels. Default 1' },
+              padding: { type: 'number', description: 'Inner margin of buttons, fields and panels. Default 10' },
+              fontSize: { type: 'number', description: 'Default font size. Default 16' },
+              fontPath: { type: 'string', description: 'Font file (.ttf, .otf) to use as the default font' },
+              scenePath: { type: 'string', description: 'Optional scene with a Control that gets this theme' },
+              nodePath: { type: 'string', description: 'With scenePath: the Control, starting with the root name' },
+            },
+            required: ['projectPath', 'outputPath'],
+          },
+        },
+        {
+          name: 'render_scene_ui',
+          description: 'Draw a UI scene at several screen sizes and return one PNG per size, to see how the layout behaves. Sizes are presets (small 320x568, phone 390x844, tablet 1024x768, hd 1280x720, fhd 1920x1080, 4k 3840x2160) or "WIDTHxHEIGHT". It opens a short-lived Godot window, so it needs a display and a graphics driver (it does not work headless).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project' },
+              sizes: { type: 'array', items: { type: 'string' }, description: 'Up to 6 sizes. Default ["hd"]' },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'ui_lint',
+          description: 'Check a UI scene for layout problems at one or more screen sizes: controls outside or sticking out of the screen, text that is cut off or wider than its box, controls that overflow their parent, touch targets that are too small, controls that cover buttons and block clicks, overlapping labels. Every problem has the node path, a severity and a suggestion. Needs a display and a graphics driver.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project' },
+              sizes: { type: 'array', items: { type: 'string' }, description: 'Up to 4 sizes (presets or "WIDTHxHEIGHT"). Default ["hd"]' },
+              pseudoLocalize: { type: 'boolean', description: 'Make every text about 40 % longer, with accents, to see how the layout copes with other languages. Default false' },
+              minTouchSize: { type: 'number', description: 'Smallest comfortable size of a button or field in pixels; 0 turns the check off. Default 44' },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'ui_check_focus',
+          description: 'Check that a UI scene can be used with a keyboard or a gamepad: lists the controls that take focus, follows the arrow keys and Tab from the first one, and reports controls that cannot be reached, dead ends, focus neighbors that do not exist, an empty focus style and a screen that opens without focus. Needs a display and a graphics driver.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project' },
+              sizes: { type: 'array', items: { type: 'string' }, description: 'Up to 4 sizes. Default ["hd"]' },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'ui_check_contrast',
+          description: 'Check the contrast of every text of a UI scene (labels, buttons, fields) against the background that is actually drawn behind it, with the WCAG limits (4.5:1, or 3:1 for large text). Failures come with a text color that passes. Disabled controls are skipped. Needs a display and a graphics driver.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project' },
+              sizes: { type: 'array', items: { type: 'string' }, description: 'Up to 4 sizes. Default ["hd"]' },
+              pseudoLocalize: { type: 'boolean', description: 'Check the texts after making them longer. Default false' },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
       ],
     }));
 
@@ -1886,6 +1985,18 @@ class GodotServer {
           return await this.handleBakeNavmesh(request.params.arguments);
         case 'render_scene_3d':
           return await this.handleRenderScene3d(request.params.arguments);
+        case 'build_ui':
+          return await this.handleBuildUi(request.params.arguments);
+        case 'make_theme':
+          return await this.handleMakeTheme(request.params.arguments);
+        case 'render_scene_ui':
+          return await this.handleRenderSceneUi(request.params.arguments);
+        case 'ui_lint':
+          return await this.handleUiInspect('lint', request.params.arguments);
+        case 'ui_check_focus':
+          return await this.handleUiInspect('focus', request.params.arguments);
+        case 'ui_check_contrast':
+          return await this.handleUiInspect('contrast', request.params.arguments);
         case 'read_scene':
           return await this.handleReadScene(request.params.arguments);
         case 'set_node_property':
@@ -4487,6 +4598,8 @@ class GodotServer {
       required: string[];
       build: (args: any) => { params: Record<string, unknown> } | { error: string };
       summary: (result: any) => string;
+      // build_ui creates the scene when it does not exist.
+      sceneMayBeNew?: boolean;
     }
   ) {
     const args = this.normalizeParameters(rawArgs ?? {});
@@ -4504,10 +4617,10 @@ class GodotServer {
     }
     if (typeof args.scenePath === 'string') {
       const sceneFile = join(projectRoot, args.scenePath);
-      if (!existsSync(sceneFile)) {
+      if (!existsSync(sceneFile) && !spec.sceneMayBeNew) {
         return this.createErrorResponse(`Scene file does not exist: ${args.scenePath}`, ['Check the path relative to the project', 'Use create_scene to create it'], { code: 'INVALID_PATH' });
       }
-      if (this.isInheritedSceneFile(sceneFile)) {
+      if (existsSync(sceneFile) && this.isInheritedSceneFile(sceneFile)) {
         return this.createErrorResponse(
           `${args.scenePath} inherits from another scene, and ${spec.label} would re-pack it and lose the inherited content`,
           ['Run the tool on the base scene, or add the nodes with add_node and set_node_property'],
@@ -5240,6 +5353,300 @@ class GodotServer {
       return { content, isError: rendered.length < (views as string[]).length || scriptErrors.scriptErrors.length > 0 };
     } catch (error: any) {
       return this.createErrorResponse(`Failed to render the scene: ${error?.message || 'Unknown error'}`, ['Ensure Godot is installed and GODOT_PATH is set correctly']);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  /** Property names of a UI spec in snake_case, which is what Godot calls them. */
+  private snakeCaseKey(key: string): string {
+    return key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+  }
+
+  /**
+   * Check one node of a UI spec ({type, name, props, children}) and its children, and return it with its
+   * property names in snake_case. Lists inside the spec are not renamed on the way to Godot, so this is done here.
+   */
+  private normalizeUiNode(node: any, depth: number, state: { count: number }): { node: Record<string, unknown> } | { error: string } {
+    if (typeof node !== 'object' || node === null || Array.isArray(node)) {
+      return { error: 'Every node of the tree must be an object like {"type": "Button", "props": {...}}' };
+    }
+    if (depth > 12) {
+      return { error: 'The tree is more than 12 levels deep' };
+    }
+    state.count += 1;
+    if (state.count > 500) {
+      return { error: 'The tree has more than 500 nodes' };
+    }
+    if (typeof node.type !== 'string' || !/^[A-Za-z][A-Za-z0-9]*$/.test(node.type)) {
+      return { error: `Invalid node type: ${String(node.type)}. Use a Control class such as VBoxContainer or Button` };
+    }
+    if (node.name !== undefined && !this.isSafeNodeName(node.name)) {
+      return { error: `Invalid node name: ${String(node.name)}. It cannot contain slashes, quotes, dots, colons, @ or %` };
+    }
+    const props: Record<string, unknown> = {};
+    if (node.props !== undefined) {
+      if (typeof node.props !== 'object' || node.props === null || Array.isArray(node.props)) {
+        return { error: `props of ${node.name ?? node.type} must be an object` };
+      }
+      for (const [rawKey, value] of Object.entries(node.props as Record<string, unknown>)) {
+        const key = this.snakeCaseKey(rawKey);
+        if (!/^[a-z][a-z0-9_]*$/.test(key)) {
+          return { error: `Invalid property name: ${rawKey}` };
+        }
+        if (key === 'script') {
+          return { error: 'script cannot be set from a UI spec' };
+        }
+        if (['theme_constants', 'theme_colors', 'theme_font_sizes', 'margins'].includes(key) && typeof value === 'object' && value !== null && !Array.isArray(value)) {
+          props[key] = Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [this.snakeCaseKey(k), v]));
+        } else {
+          props[key] = value;
+        }
+      }
+    }
+    const children: Record<string, unknown>[] = [];
+    if (node.children !== undefined) {
+      if (!Array.isArray(node.children)) {
+        return { error: `children of ${node.name ?? node.type} must be a list` };
+      }
+      for (const child of node.children) {
+        const result = this.normalizeUiNode(child, depth + 1, state);
+        if ('error' in result) {
+          return result;
+        }
+        children.push(result.node);
+      }
+    }
+    return { node: { type: node.type, ...(node.name !== undefined ? { name: node.name } : {}), props, children } };
+  }
+
+  /** Handle the build_ui tool */
+  private async handleBuildUi(rawArgs: any) {
+    return this.runEditTool(rawArgs, {
+      operation: 'build_ui',
+      label: 'build_ui',
+      required: ['scenePath'],
+      sceneMayBeNew: true,
+      build: (args) => {
+        if (!String(args.scenePath).endsWith('.tscn')) {
+          return { error: 'scenePath must end in .tscn' };
+        }
+        if (typeof args.tree !== 'object' || args.tree === null || Array.isArray(args.tree)) {
+          return { error: 'tree must be an object with the root node of the UI' };
+        }
+        const normalized = this.normalizeUiNode(args.tree, 1, { count: 0 });
+        if ('error' in normalized) {
+          return { error: normalized.error };
+        }
+        return { params: this.pickParams(args, ['parentNodePath'], { scenePath: args.scenePath, tree: normalized.node }) };
+      },
+      summary: (r) => `${r.created_scene ? 'Created the scene with' : 'Added'} ${r.nodes} node(s) at ${r.root}${r.warnings.length > 0 ? `. Warnings: ${r.warnings.join('; ')}` : ''}.`,
+    });
+  }
+
+  /** Handle the make_theme tool */
+  private async handleMakeTheme(rawArgs: any) {
+    return this.runEditTool(rawArgs, {
+      operation: 'make_theme',
+      label: 'make_theme',
+      required: ['outputPath'],
+      build: (args) => {
+        if (!String(args.outputPath).endsWith('.tres')) {
+          return { error: 'outputPath must end in .tres' };
+        }
+        if (args.palette !== undefined) {
+          if (typeof args.palette !== 'object' || args.palette === null || Array.isArray(args.palette)) {
+            return { error: 'palette must be an object like {"primary": "#4f8cff"}' };
+          }
+          for (const [key, value] of Object.entries(args.palette as Record<string, unknown>)) {
+            if (!['background', 'text', 'primary', 'accent', 'danger'].includes(key)) {
+              return { error: `palette accepts background, text, primary, accent and danger; not ${key}` };
+            }
+            if (!/^#[0-9a-fA-F]{6}$/.test(String(value))) {
+              return { error: `palette.${key} must look like #4f8cff` };
+            }
+          }
+        }
+        const problem = this.checkNumbers(args, { radius: [0, 64], borderWidth: [0, 16], padding: [0, 64], fontSize: [6, 200] });
+        if (problem) {
+          return { error: problem };
+        }
+        if (args.scenePath !== undefined && (typeof args.nodePath !== 'string' || args.nodePath === '')) {
+          return { error: 'nodePath is required with scenePath' };
+        }
+        if (args.fontPath !== undefined && !existsSync(join(resolvePath(args.projectPath), String(args.fontPath)))) {
+          return { error: `Font does not exist: ${args.fontPath}` };
+        }
+        return { params: this.pickParams(args, ['palette', 'radius', 'borderWidth', 'padding', 'fontSize', 'fontPath', 'scenePath', 'nodePath'], { outputPath: args.outputPath }) };
+      },
+      summary: (r) => `Saved ${r.output} with styles for ${r.types.join(', ')}${r.assigned_to ? `; set on ${r.assigned_to}` : ''}.`,
+    });
+  }
+
+  /** Sizes as [width, height] from presets, "WIDTHxHEIGHT" strings or [w, h] pairs; or an error text. */
+  private parseUiSizes(value: unknown, max: number): number[][] | string {
+    const presets: Record<string, number[]> = { small: [320, 568], phone: [390, 844], tablet: [1024, 768], hd: [1280, 720], fhd: [1920, 1080], '4k': [3840, 2160] };
+    const list: unknown[] = value === undefined ? ['hd'] : Array.isArray(value) ? value : [value];
+    if (list.length === 0 || list.length > max) {
+      return `sizes must have 1 to ${max} entries`;
+    }
+    const sizes: number[][] = [];
+    for (const entry of list) {
+      let size: number[] | undefined;
+      if (typeof entry === 'string' && presets[entry]) {
+        size = presets[entry];
+      } else if (typeof entry === 'string' && /^\d{2,4}x\d{2,4}$/.test(entry)) {
+        size = entry.split('x').map(Number);
+      } else if (Array.isArray(entry) && entry.length === 2 && entry.every((n) => Number.isInteger(n))) {
+        size = entry as number[];
+      }
+      if (!size || size.some((n) => n < 64 || n > 4096)) {
+        return `Invalid size ${JSON.stringify(entry)}: use ${Object.keys(presets).join(', ')} or WIDTHxHEIGHT with 64 to 4096`;
+      }
+      if (sizes.some((other) => other[0] === size![0] && other[1] === size![1])) {
+        return `The size ${size[0]}x${size[1]} is repeated`;
+      }
+      sizes.push(size);
+    }
+    return sizes;
+  }
+
+  /**
+   * Run one of the windowed UI scripts (they need a renderer). Returns Godot's output, or an error response
+   * when Godot could not start or timed out.
+   */
+  private async runWindowedScript(script: string, projectRoot: string, scriptArgs: string[], timeoutMs: number): Promise<{ output: string } | { error: any }> {
+    try {
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+      }
+      if (!this.godotPath) {
+        return { error: this.createErrorResponse('Could not find a valid Godot executable path', ['Set GODOT_PATH environment variable to specify the correct path'], { code: 'GODOT_NOT_FOUND' }) };
+      }
+      const { stdout, stderr } = await execFileAsync(
+        this.godotPath,
+        ['--path', projectRoot, '--script', script, '--', ...scriptArgs],
+        { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 }
+      );
+      return { output: `${stdout}\n${stderr}` };
+    } catch (error: any) {
+      if (error?.killed) {
+        return { error: this.createErrorResponse(`Godot did not finish within ${Math.round(timeoutMs / 1000)} seconds`, ['The scene may be stuck loading, or no display is available'], { code: 'TIMEOUT' }) };
+      }
+      if (typeof error?.code !== 'number') {
+        return { error: this.createErrorResponse(`Failed to run Godot: ${error?.message || 'Unknown error'}`, ['Ensure Godot is installed and GODOT_PATH is set correctly']) };
+      }
+      return { output: `${error?.stdout ?? ''}\n${error?.stderr ?? ''}` };
+    }
+  }
+
+  /** The common checks of the windowed UI tools: project, scene and sizes. */
+  private checkUiTarget(args: any, maxSizes: number): { projectRoot: string; sizes: number[][] } | { error: any } {
+    if (typeof args.projectPath !== 'string' || !args.projectPath || typeof args.scenePath !== 'string' || !args.scenePath) {
+      return { error: this.createErrorResponse('projectPath and scenePath are required', ['Provide both as text'], { code: 'INVALID_ARGUMENT' }) };
+    }
+    if (!this.validatePath(args.projectPath)) {
+      return { error: this.createErrorResponse('Invalid project path', ['Provide a valid path without ".." segments'], { code: 'INVALID_PATH' }) };
+    }
+    const projectRoot = resolvePath(args.projectPath);
+    if (!existsSync(join(projectRoot, 'project.godot'))) {
+      return { error: this.createErrorResponse(`Not a valid Godot project: ${args.projectPath}`, ['Ensure the path points to a directory containing a project.godot file'], { code: 'PROJECT_NOT_FOUND' }) };
+    }
+    if (!existsSync(join(projectRoot, args.scenePath))) {
+      return { error: this.createErrorResponse(`Scene file does not exist: ${args.scenePath}`, ['Check the path relative to the project'], { code: 'INVALID_PATH' }) };
+    }
+    const sizes = this.parseUiSizes(args.sizes, maxSizes);
+    if (typeof sizes === 'string') {
+      return { error: this.createErrorResponse(sizes, ['Check sizes'], { code: 'INVALID_ARGUMENT' }) };
+    }
+    return { projectRoot, sizes };
+  }
+
+  /** Handle the render_scene_ui tool: one PNG per screen size. */
+  private async handleRenderSceneUi(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    const target = this.checkUiTarget(args, 6);
+    if ('error' in target) {
+      return target.error;
+    }
+    const tempDir = mkdtempSync(join(tmpdir(), 'godot-mcp-renderui-'));
+    try {
+      const labels = target.sizes.map(([w, h]) => `${w}x${h}`);
+      const ran = await this.runWindowedScript(this.renderSceneUiPath, target.projectRoot, [`res://${args.scenePath}`, tempDir, labels.join(',')], 120000);
+      if ('error' in ran) {
+        return ran.error;
+      }
+      const rendered = labels.filter((label) => existsSync(join(tempDir, `${label}.png`)));
+      if (rendered.length === 0) {
+        const reason = ran.output.split(/\r?\n/).find((line) => line.startsWith('RENDER_FAIL')) ?? ran.output.trim().split(/\r?\n/).slice(-3).join('\n');
+        return this.createErrorResponse(
+          `Godot did not render the scene: ${reason || 'no output'}`,
+          ['This tool needs a display and a graphics driver; it cannot run headless or without a display', 'Check the scene with check_project_scripts']
+        );
+      }
+      const scriptErrors = this.groupScriptErrors(this.parseScriptErrors(ran.output));
+      const content: any[] = [
+        { type: 'text', text: JSON.stringify({ scene: args.scenePath, sizes: rendered, missingSizes: labels.filter((l) => !rendered.includes(l)), scriptErrors: scriptErrors.scriptErrors }, null, 2) },
+      ];
+      for (const label of rendered) {
+        content.push({ type: 'text', text: `Size: ${label}` });
+        content.push({ type: 'image', data: readFileSync(join(tempDir, `${label}.png`)).toString('base64'), mimeType: 'image/png' });
+      }
+      return { content, isError: rendered.length < labels.length || scriptErrors.scriptErrors.length > 0 };
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  /** Handle ui_lint, ui_check_focus and ui_check_contrast: run inspect_ui.gd once per size and join the results. */
+  private async handleUiInspect(mode: 'lint' | 'focus' | 'contrast', rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    const target = this.checkUiTarget(args, 4);
+    if ('error' in target) {
+      return target.error;
+    }
+    const problem = this.checkNumbers(args, { minTouchSize: [0, 500] });
+    if (problem) {
+      return this.createErrorResponse(problem, ['Check minTouchSize'], { code: 'INVALID_ARGUMENT' });
+    }
+    if (args.pseudoLocalize !== undefined && typeof args.pseudoLocalize !== 'boolean') {
+      return this.createErrorResponse('pseudoLocalize must be true or false', ['Check pseudoLocalize'], { code: 'INVALID_ARGUMENT' });
+    }
+
+    const tempDir = mkdtempSync(join(tmpdir(), 'godot-mcp-inspectui-'));
+    try {
+      const results: any[] = [];
+      for (const [width, height] of target.sizes) {
+        const outFile = join(tempDir, `${width}x${height}.json`);
+        const ran = await this.runWindowedScript(
+          this.inspectUiPath,
+          target.projectRoot,
+          [`res://${args.scenePath}`, mode, String(width), String(height), args.pseudoLocalize === true ? '1' : '0', outFile, String(args.minTouchSize ?? 44)],
+          120000
+        );
+        if ('error' in ran) {
+          return ran.error;
+        }
+        if (!existsSync(outFile)) {
+          const reason = ran.output.split(/\r?\n/).find((line) => line.startsWith('INSPECT_FAIL')) ?? ran.output.trim().split(/\r?\n/).slice(-3).join('\n');
+          return this.createErrorResponse(
+            `Godot did not inspect the scene at ${width}x${height}: ${reason || 'no output'}`,
+            ['This tool needs a display and a graphics driver; it cannot run headless or without a display', 'Check the scene with check_project_scripts']
+          );
+        }
+        results.push(JSON.parse(readFileSync(outFile, 'utf8')));
+      }
+
+      const failing = results.reduce((sum, r) => sum + (r.counts?.error ?? 0), 0);
+      const lines = results.map((r) => `${r.size[0]}x${r.size[1]}: ${r.counts.error} error(s), ${r.counts.warning} warning(s), ${r.counts.info} info`);
+      const first = results.flatMap((r) => (r.issues as any[]).filter((i) => i.severity !== 'info').slice(0, 5).map((i) => `- [${i.severity}] ${i.node}: ${i.message}`));
+      return {
+        content: [
+          { type: 'text', text: [`${mode} of ${args.scenePath}`, ...lines, ...(first.length > 0 ? ['', ...first.slice(0, 12)] : [])].join('\n') },
+          { type: 'text', text: JSON.stringify({ scene: args.scenePath, mode, results }, null, 2) },
+        ],
+        isError: failing > 0,
+      };
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }

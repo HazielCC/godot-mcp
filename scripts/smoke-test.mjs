@@ -44,6 +44,12 @@ const EXPECTED_TOOLS = [
   'scatter_multimesh',
   'bake_navmesh',
   'render_scene_3d',
+  'build_ui',
+  'make_theme',
+  'render_scene_ui',
+  'ui_lint',
+  'ui_check_focus',
+  'ui_check_contrast',
 ];
 
 const TIMEOUT_MS = 15000;

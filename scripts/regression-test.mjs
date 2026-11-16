@@ -173,6 +173,48 @@ async function main() {
   const kept = await callTool('add_node', { projectPath: project, scenePath: 'scenes/multi.tscn', nodeType: 'Node3D', nodeName: 'Extra' });
   check('a failed operation reports the failure', kept.isError === true);
   check('a failed operation leaves the MultiMesh data as it was', readFileSync(join(project, 'scenes', 'multi.tscn'), 'utf8') === multiText);
+
+  // UI tools: bad arguments are rejected before Godot runs.
+  const badTree = await callTool('build_ui', { projectPath: project, scenePath: 'scenes/ui.tscn', tree: { type: 'Button', props: { script: 'res://x.gd' } } });
+  check('build_ui does not accept a script', badTree.isError === true && textOf(badTree).includes('script'));
+
+  const badType = await callTool('build_ui', { projectPath: project, scenePath: 'scenes/ui.tscn', tree: { type: '../Evil' } });
+  check('build_ui rejects an invalid node type', badType.isError === true && textOf(badType).includes('Invalid node type'));
+
+  const badChild = await callTool('build_ui', { projectPath: project, scenePath: 'scenes/ui.tscn', tree: { type: 'VBoxContainer', children: [{ type: 'Button', name: 'a/b' }] } });
+  check('build_ui rejects an unsafe node name', badChild.isError === true && textOf(badChild).includes('Invalid node name'));
+
+  let deep = { type: 'Control' };
+  for (let i = 0; i < 14; i++) deep = { type: 'VBoxContainer', children: [deep] };
+  const tooDeep = await callTool('build_ui', { projectPath: project, scenePath: 'scenes/ui.tscn', tree: deep });
+  check('build_ui limits the depth', tooDeep.isError === true && textOf(tooDeep).includes('levels'));
+
+  const notScene = await callTool('build_ui', { projectPath: project, scenePath: 'scenes/ui.res', tree: { type: 'Control' } });
+  check('build_ui needs a .tscn path', notScene.isError === true && textOf(notScene).includes('.tscn'));
+
+  const newScene = await callTool('build_ui', { projectPath: project, scenePath: 'scenes/ui.tscn', tree: { type: 'Control' } });
+  check('build_ui reports a Godot that failed on a new scene', newScene.isError === true && !textOf(newScene).includes('Created'));
+
+  const badPalette = await callTool('make_theme', { projectPath: project, outputPath: 'themes/a.tres', palette: { primary: 'blue' } });
+  check('make_theme checks the colors', badPalette.isError === true && textOf(badPalette).includes('primary'));
+
+  const unknownColor = await callTool('make_theme', { projectPath: project, outputPath: 'themes/a.tres', palette: { sky: '#ffffff' } });
+  check('make_theme rejects an unknown palette key', unknownColor.isError === true && textOf(unknownColor).includes('sky'));
+
+  const badSize = await callTool('render_scene_ui', { projectPath: project, scenePath: 'scenes/main.tscn', sizes: ['huge'] });
+  check('render_scene_ui rejects an unknown size', badSize.isError === true && code(badSize) === 'INVALID_ARGUMENT');
+
+  const manySizes = await callTool('ui_lint', { projectPath: project, scenePath: 'scenes/main.tscn', sizes: ['small', 'phone', 'tablet', 'hd', 'fhd'] });
+  check('ui_lint limits the sizes', manySizes.isError === true && textOf(manySizes).includes('1 to 4'));
+
+  const badTouch = await callTool('ui_lint', { projectPath: project, scenePath: 'scenes/main.tscn', minTouchSize: -5 });
+  check('ui_lint checks minTouchSize', badTouch.isError === true && textOf(badTouch).includes('minTouchSize'));
+
+  const failedInspect = await callTool('ui_check_focus', { projectPath: project, scenePath: 'scenes/main.tscn' });
+  check('ui_check_focus reports a Godot that failed', failedInspect.isError === true && code(failedInspect) !== 'INVALID_ARGUMENT');
+
+  const missingScene = await callTool('ui_check_contrast', { projectPath: project, scenePath: 'scenes/none.tscn' });
+  check('ui_check_contrast reports a missing scene', missingScene.isError === true && textOf(missingScene).includes('does not exist'));
 }
 
 main()
