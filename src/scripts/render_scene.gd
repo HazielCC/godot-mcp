@@ -4,19 +4,21 @@ extends SceneTree
 # Draws a scene for a few frames and saves what the window shows as a PNG. Unlike the other scripts
 # this one needs a renderer, so it must not run with --headless.
 #
-# Usage: godot --path <project> --resolution WxH --script render_scene.gd -- <scene> <out.png> [zoom] [center_x] [center_y]
+# Usage: godot --path <project> --resolution WxH --script render_scene.gd -- <scene> <out.png> <zoom> <width> <height> [center_x] [center_y]
 # Prints "RENDER_OK <out.png>" or "RENDER_FAIL <reason>".
 
 var _out_path: String = ""
 
 func _initialize() -> void:
     var args: PackedStringArray = OS.get_cmdline_user_args()
-    if args.size() < 2:
-        _fail("usage: <scene> <out.png> [zoom] [center_x] [center_y]")
+    if args.size() < 5:
+        _fail("usage: <scene> <out.png> <zoom> <width> <height> [center_x] [center_y]")
         return
     var scene_path: String = args[0]
     _out_path = args[1]
-    var zoom: float = float(args[2]) if args.size() > 2 else 1.0
+    var zoom: float = float(args[2])
+    # The window size is not final yet in _initialize, so the size comes from the arguments.
+    var size: Vector2 = Vector2(float(args[3]), float(args[4]))
     if zoom <= 0.0:
         _fail("zoom must be greater than 0")
         return
@@ -28,9 +30,8 @@ func _initialize() -> void:
     root.add_child(packed.instantiate())
 
     # A scene with its own Camera2D keeps it. Otherwise zoom and center place the view.
-    if args.size() > 4 or zoom != 1.0:
-        var size: Vector2 = Vector2(root.size)
-        var center: Vector2 = Vector2(float(args[3]), float(args[4])) if args.size() > 4 else size / 2.0
+    if args.size() > 6 or zoom != 1.0:
+        var center: Vector2 = Vector2(float(args[5]), float(args[6])) if args.size() > 6 else size / 2.0
         root.canvas_transform = Transform2D(0.0, Vector2(zoom, zoom), 0.0, size / 2.0 - center * zoom)
     _capture.call_deferred()
 

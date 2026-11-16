@@ -1702,7 +1702,8 @@ func auto_collision(params: Dictionary) -> void:
             continue
         var points: PackedVector2Array = PackedVector2Array()
         for point: Vector2 in source:
-            points.append(to_target * (point - Vector2(rect.position) + origin))
+            # opaque_to_polygons gives points relative to the top left corner of rect.
+            points.append(to_target * (point + origin))
         if _polygon_area(points) >= min_area:
             kept.append(points)
     if kept.is_empty():

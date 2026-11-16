@@ -4497,7 +4497,7 @@ class GodotServer {
       if (!this.godotPath) {
         return this.createErrorResponse('Could not find a valid Godot executable path', ['Set GODOT_PATH environment variable to specify the correct path'], { code: 'GODOT_NOT_FOUND' });
       }
-      const scriptArgs = [`res://${args.scenePath}`, outFile, String(zoom)];
+      const scriptArgs = [`res://${args.scenePath}`, outFile, String(zoom), String(width), String(height)];
       if (hasCenter) {
         scriptArgs.push(String(args.centerX), String(args.centerY));
       }
