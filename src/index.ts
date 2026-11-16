@@ -79,6 +79,15 @@ type TestRecord = { suite: string; name: string; status: string; time: number; m
 /** The last full run_tests result of a project, kept in .godot/mcp_tests_last.json for rerunFailed. */
 type TestState = { directory: string; savedAt: string; tests: TestRecord[] };
 
+/**
+ * Operations that load a scene, change it and save it again with Godot. Godot's headless mode has no
+ * rendering server, and a MultiMesh keeps its instance data there, so such a save would erase it.
+ */
+const REPACKING_OPERATIONS = [
+  'add_node', 'load_sprite', 'set_node_property', 'save_scene', 'import_spritesheet', 'auto_collision',
+  'build_tilemap', 'setup_parallax_2d', 'build_blockout', 'create_pbr_material', 'bake_navmesh',
+];
+
 /** Properties that are stored inside the node's transform (see setPropertyInInheritedScene). */
 const TRANSFORM_PROPERTIES = ['position', 'rotation', 'rotation_degrees', 'scale', 'skew'];
 
@@ -295,6 +304,11 @@ const PROJECT_PATH_PARAMS: Record<string, string[]> = {
   build_tilemap: ['scenePath', 'texturePath', 'tileSetPath'],
   setup_parallax_2d: ['scenePath'],
   render_scene_2d: ['scenePath'],
+  build_blockout: ['scenePath'],
+  create_pbr_material: ['folder', 'outputPath', 'scenePath'],
+  scatter_multimesh: ['scenePath', 'meshPath'],
+  bake_navmesh: ['scenePath'],
+  render_scene_3d: ['scenePath'],
 };
 
 
@@ -346,6 +360,7 @@ class GodotServer {
   private operationsScriptPath: string;
   private checkScriptsPath: string;
   private renderScenePath: string;
+  private renderScene3dPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
   private godotDebugMode: boolean = GODOT_DEBUG_MODE;
@@ -415,6 +430,7 @@ class GodotServer {
     this.operationsScriptPath = join(__dirname, 'scripts', 'godot_operations.gd');
     this.checkScriptsPath = join(__dirname, 'scripts', 'check_scripts.gd');
     this.renderScenePath = join(__dirname, 'scripts', 'render_scene.gd');
+    this.renderScene3dPath = join(__dirname, 'scripts', 'render_scene_3d.gd');
     if (debugMode) console.error(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
 
     // Initialize the MCP server
@@ -791,6 +807,20 @@ class GodotServer {
     projectPath: string
   ): Promise<{ stdout: string; stderr: string }> {
     this.logDebug(`Executing operation: ${operation} in project: ${projectPath}`);
+
+    if (REPACKING_OPERATIONS.includes(operation) && typeof params.scenePath === 'string') {
+      const sceneFile = join(resolvePath(projectPath), params.scenePath);
+      if (existsSync(sceneFile)) {
+        const text = readFileSync(sceneFile, 'utf8');
+        if (text.includes('type="MultiMesh"') && /^buffer = /m.test(text)) {
+          throw new Error(
+            `${params.scenePath} has a MultiMesh with instance data (from scatter_multimesh or the editor). ` +
+            'Godot in headless mode cannot keep that data, so saving the scene would erase it. ' +
+            'Put the MultiMeshInstance3D in its own scene, or make this change in the editor'
+          );
+        }
+      }
+    }
     this.logDebug(`Original operation params: ${JSON.stringify(params)}`);
 
     // Convert camelCase parameters to snake_case for Godot script
@@ -1555,6 +1585,109 @@ class GodotServer {
             required: ['projectPath', 'scenePath'],
           },
         },
+        {
+          name: 'build_blockout',
+          description: 'Build a greybox 3D level from rows of text and add it to a scene. Each character of the legend has a height, elevation, color and collision flag; runs of equal characters in a row become one box (a StaticBody3D with a MeshInstance3D and a BoxShape3D, or only a MeshInstance3D without collision). "." and spaces stay empty.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project (it must not inherit from another scene)' },
+              rows: { type: 'array', items: { type: 'string' }, description: 'One string per row of the map; rows go along +Z and columns along +X, for example ["#####", "#...#", "#####"]' },
+              legend: { type: 'object', description: 'Style of each character, for example {"#": {"height": 3, "color": "#8a8a8a"}, "~": {"height": 0.2, "color": "#3a6ea5", "collision": false}}. Optional per character: elevation (base height, default 0)' },
+              cellSize: { type: 'number', description: 'Size of one cell in meters. Default 2' },
+              parentNodePath: { type: 'string', description: 'Parent of the container, such as "Level". Default: the scene root' },
+              nodeName: { type: 'string', description: 'Name of the container Node3D. Default: Blockout' },
+              originX: { type: 'number', description: 'Cell column of the first character. Default 0' },
+              originZ: { type: 'number', description: 'Cell row of the first row. Default 0' },
+            },
+            required: ['projectPath', 'scenePath', 'rows', 'legend'],
+          },
+        },
+        {
+          name: 'create_pbr_material',
+          description: 'Create a StandardMaterial3D (.tres) from a folder of textures, matching files by name: albedo/basecolor/diffuse, normal, roughness, metallic, ao, orm (packed), emission, height. Optionally assign it to a node of a scene. The textures must be imported.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              folder: { type: 'string', description: 'Folder with the texture files, relative to the project' },
+              outputPath: { type: 'string', description: 'Where to save the material, relative to the project, ending in .tres' },
+              uvScale: { type: 'number', description: 'Texture repeat. Default 1' },
+              triplanar: { type: 'boolean', description: 'Use triplanar mapping. Default false' },
+              scenePath: { type: 'string', description: 'Optional scene with a node that gets this material as its material override' },
+              nodePath: { type: 'string', description: 'With scenePath: the MeshInstance3D (or other GeometryInstance3D), starting with the root name' },
+            },
+            required: ['projectPath', 'folder', 'outputPath'],
+          },
+        },
+        {
+          name: 'scatter_multimesh',
+          description: 'Add a MultiMeshInstance3D with many copies of a mesh spread at random over a rectangle (trees, rocks, grass). The result is repeatable: the same seed gives the same layout. The mesh is a Mesh resource or a simple primitive. Because Godot cannot store a MultiMesh in headless mode, this tool writes the scene file itself; other tools that re-save a scene with scattered data refuse to run on it.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project' },
+              meshPath: { type: 'string', description: 'Mesh resource to copy: .tres, .res or .obj (a mesh inside a .glb must be saved as .tres first). Without it, primitive is used' },
+              primitive: { type: 'string', enum: ['box', 'sphere', 'cylinder', 'cone'], description: 'Shape when there is no meshPath. Default box' },
+              primitiveSize: { type: 'number', description: 'Size of the primitive in meters. Default 1' },
+              color: { type: 'string', description: 'Color of the primitive, such as "#4f8a3c"' },
+              count: { type: 'number', description: 'Number of copies, 1 to 5000. Default 100' },
+              centerX: { type: 'number', description: 'Center of the area on X. Default 0' },
+              centerZ: { type: 'number', description: 'Center of the area on Z. Default 0' },
+              y: { type: 'number', description: 'Height of the copies. Default 0' },
+              sizeX: { type: 'number', description: 'Width of the area on X. Default 20' },
+              sizeZ: { type: 'number', description: 'Depth of the area on Z. Default 20' },
+              minScale: { type: 'number', description: 'Smallest scale. Default 1' },
+              maxScale: { type: 'number', description: 'Largest scale. Default 1' },
+              randomYaw: { type: 'boolean', description: 'Turn each copy at random around the vertical axis. Default true' },
+              tiltDegrees: { type: 'number', description: 'Largest random tilt in degrees. Default 0' },
+              seed: { type: 'number', description: 'Random seed. Default 1' },
+              parentNodePath: { type: 'string', description: 'Parent of the node. Default: the scene root' },
+              nodeName: { type: 'string', description: 'Name of the node. Default: Scatter' },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'bake_navmesh',
+          description: 'Bake a navigation mesh from the geometry of a 3D scene (mesh instances and/or static colliders) and add it in a NavigationRegion3D. The scene is loaded into the scene tree to read it, so scripts in it run their _ready.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project (it must not inherit from another scene)' },
+              geometryPath: { type: 'string', description: 'Node whose children are read, starting with the root name. Default: the scene root' },
+              parsedGeometry: { type: 'string', enum: ['meshes', 'colliders', 'both'], description: 'What to read. Default both' },
+              agentRadius: { type: 'number', description: 'Radius of the walking agent in meters. Default 0.5' },
+              agentHeight: { type: 'number', description: 'Height of the agent. Default 1.8' },
+              agentMaxClimb: { type: 'number', description: 'Highest step the agent climbs. Default 0.25' },
+              agentMaxSlope: { type: 'number', description: 'Steepest slope in degrees. Default 45' },
+              cellSize: { type: 'number', description: 'Voxel size on the ground plane. Default 0.25' },
+              cellHeight: { type: 'number', description: 'Voxel height. Default 0.25' },
+              parentNodePath: { type: 'string', description: 'Parent of the region. Default: the scene root' },
+              nodeName: { type: 'string', description: 'Name of the region. Default: NavigationRegion3D' },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'render_scene_3d',
+          description: 'Draw a 3D scene from several viewpoints (iso, front, back, left, right, top) and return one PNG per view. The camera frames everything the scene shows, and a sun and an environment are added when the scene has none. It opens a short-lived Godot window, so it needs a display and a graphics driver (it does not work headless).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Scene file, relative to the project' },
+              views: { type: 'array', items: { type: 'string', enum: ['iso', 'front', 'back', 'left', 'right', 'top'] }, description: 'Viewpoints, 1 to 6. Default ["iso"]' },
+              width: { type: 'number', description: 'Image width in pixels, 64 to 2048. Default 640' },
+              height: { type: 'number', description: 'Image height in pixels, 64 to 2048. Default 480' },
+              light: { type: 'string', enum: ['auto', 'none'], description: 'auto (default) adds a sun and an environment when the scene has none; none leaves the scene as it is' },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
       ],
     }));
 
@@ -1621,6 +1754,16 @@ class GodotServer {
           return await this.handleSetupParallax2d(request.params.arguments);
         case 'render_scene_2d':
           return await this.handleRenderScene2d(request.params.arguments);
+        case 'build_blockout':
+          return await this.handleBuildBlockout(request.params.arguments);
+        case 'create_pbr_material':
+          return await this.handleCreatePbrMaterial(request.params.arguments);
+        case 'scatter_multimesh':
+          return await this.handleScatterMultimesh(request.params.arguments);
+        case 'bake_navmesh':
+          return await this.handleBakeNavmesh(request.params.arguments);
+        case 'render_scene_3d':
+          return await this.handleRenderScene3d(request.params.arguments);
         case 'read_scene':
           return await this.handleReadScene(request.params.arguments);
         case 'set_node_property':
@@ -4536,6 +4679,412 @@ class GodotServer {
         ],
         isError: scriptErrors.scriptErrors.length > 0,
       };
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to render the scene: ${error?.message || 'Unknown error'}`, ['Ensure Godot is installed and GODOT_PATH is set correctly']);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  /** Name that is safe to write in a scene: no slashes, quotes, dots, colons, @ or %. */
+  private isSafeNodeName(value: unknown): boolean {
+    return typeof value === 'string' && /^[^"/\\:@.%]+$/.test(value);
+  }
+
+  /** Copy the listed keys of args that are present into a new params object. */
+  private pickParams(args: any, keys: string[], into: Record<string, unknown> = {}): Record<string, unknown> {
+    for (const key of keys) {
+      if (args[key] !== undefined) {
+        into[key] = args[key];
+      }
+    }
+    return into;
+  }
+
+  /** The first problem with numeric options (each must be a number within its range), or undefined. */
+  private checkNumbers(args: any, limits: Record<string, [number, number]>): string | undefined {
+    for (const [key, [min, max]] of Object.entries(limits)) {
+      const value = args[key];
+      if (value !== undefined && !(typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max)) {
+        return `${key} must be a number from ${min} to ${max}`;
+      }
+    }
+    return undefined;
+  }
+
+  /** Handle the build_blockout tool */
+  private async handleBuildBlockout(rawArgs: any) {
+    return this.runEditTool(rawArgs, {
+      operation: 'build_blockout',
+      label: 'build_blockout',
+      required: ['scenePath'],
+      build: (args) => {
+        if (!Array.isArray(args.rows) || args.rows.length === 0 || args.rows.length > 256 || !args.rows.every((row: unknown) => typeof row === 'string')) {
+          return { error: 'rows must be a list of 1 to 256 strings' };
+        }
+        if (typeof args.legend !== 'object' || args.legend === null || Array.isArray(args.legend)) {
+          return { error: 'legend must be an object that maps each character to its style' };
+        }
+        // Sent as a list: the keys of an object would be renamed to snake_case on the way to Godot.
+        const legend: Record<string, unknown>[] = [];
+        for (const [char, style] of Object.entries(args.legend as Record<string, any>)) {
+          if ([...char].length !== 1) {
+            return { error: `legend key "${char}" must be one character` };
+          }
+          const problem = this.checkNumbers(style ?? {}, { height: [0.01, 1000], elevation: [-1000, 1000] });
+          if (problem) {
+            return { error: `legend "${char}": ${problem}` };
+          }
+          if (style?.color !== undefined && !/^#?[0-9a-fA-F]{6}$/.test(String(style.color))) {
+            return { error: `legend "${char}": color must look like #8a8a8a` };
+          }
+          legend.push({ char, height: style?.height ?? 1, elevation: style?.elevation ?? 0, color: style?.color ?? '#9a9a9a', collision: style?.collision !== false });
+        }
+        const used = new Set<string>(args.rows.flatMap((row: string) => [...row]));
+        const missing = [...used].filter((c) => c !== '.' && c !== ' ' && !legend.some((entry) => entry.char === c));
+        if (missing.length > 0) {
+          return { error: `Characters not in the legend: ${missing.join(' ')}` };
+        }
+        const cells = args.rows.reduce((sum: number, row: string) => sum + [...row].filter((c) => c !== '.' && c !== ' ').length, 0);
+        if (cells === 0 || cells > 20000) {
+          return { error: 'rows must have between 1 and 20000 filled cells' };
+        }
+        const problem = this.checkNumbers(args, { cellSize: [0.05, 100], originX: [-10000, 10000], originZ: [-10000, 10000] });
+        if (problem) {
+          return { error: problem };
+        }
+        if (args.nodeName !== undefined && !this.isSafeNodeName(args.nodeName)) {
+          return { error: 'Invalid nodeName: it cannot contain slashes, quotes, dots, colons, @ or %' };
+        }
+        return { params: this.pickParams(args, ['cellSize', 'parentNodePath', 'nodeName', 'originX', 'originZ'], { scenePath: args.scenePath, rows: args.rows, legend }) };
+      },
+      summary: (r) => `Built ${r.boxes} boxes (${r.cells} cells of ${r.cell_size} m) in ${r.node}.`,
+    });
+  }
+
+  /** Handle the create_pbr_material tool */
+  private async handleCreatePbrMaterial(rawArgs: any) {
+    return this.runEditTool(rawArgs, {
+      operation: 'create_pbr_material',
+      label: 'create_pbr_material',
+      required: ['folder', 'outputPath'],
+      build: (args) => {
+        if (!String(args.outputPath).endsWith('.tres')) {
+          return { error: 'outputPath must end in .tres' };
+        }
+        if (!existsSync(join(resolvePath(args.projectPath), args.folder))) {
+          return { error: `Folder does not exist: ${args.folder}` };
+        }
+        if (args.scenePath !== undefined && (typeof args.nodePath !== 'string' || args.nodePath === '')) {
+          return { error: 'nodePath is required with scenePath' };
+        }
+        const problem = this.checkNumbers(args, { uvScale: [0.001, 1000] });
+        if (problem) {
+          return { error: problem };
+        }
+        return { params: this.pickParams(args, ['uvScale', 'triplanar', 'scenePath', 'nodePath'], { folder: args.folder, outputPath: args.outputPath }) };
+      },
+      summary: (r) => `Saved ${r.output} with ${r.slots.join(', ')}${r.ignored.length > 0 ? `; ignored ${r.ignored.join(', ')}` : ''}${r.assigned_to ? `; assigned to ${r.assigned_to}` : ''}.`,
+    });
+  }
+
+  /**
+   * Handle the scatter_multimesh tool. Written as text, not with Godot: Godot's headless mode has no
+   * rendering server, so it cannot store the transforms of a MultiMesh. The scene file gets a MultiMesh
+   * sub-resource with its buffer, and a MultiMeshInstance3D node that uses it.
+   */
+  private async handleScatterMultimesh(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    for (const key of ['projectPath', 'scenePath']) {
+      if (typeof args[key] !== 'string' || args[key] === '') {
+        return this.createErrorResponse(`${key} is required and must be text`, [`Provide ${key}`], { code: 'INVALID_ARGUMENT' });
+      }
+    }
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse('Invalid project path', ['Provide a valid path without ".." segments'], { code: 'INVALID_PATH' });
+    }
+    const projectRoot = resolvePath(args.projectPath);
+    if (!existsSync(join(projectRoot, 'project.godot'))) {
+      return this.createErrorResponse(`Not a valid Godot project: ${args.projectPath}`, ['Ensure the path points to a directory containing a project.godot file'], { code: 'PROJECT_NOT_FOUND' });
+    }
+    const sceneFile = join(projectRoot, args.scenePath);
+    if (!existsSync(sceneFile)) {
+      return this.createErrorResponse(`Scene file does not exist: ${args.scenePath}`, ['Check the path relative to the project'], { code: 'INVALID_PATH' });
+    }
+
+    if (args.count !== undefined && !(Number.isInteger(args.count) && args.count >= 1 && args.count <= 5000)) {
+      return this.createErrorResponse('count must be a whole number from 1 to 5000', ['Check count'], { code: 'INVALID_ARGUMENT' });
+    }
+    const problem = this.checkNumbers(args, {
+      primitiveSize: [0.01, 1000], centerX: [-100000, 100000], centerZ: [-100000, 100000], y: [-100000, 100000],
+      sizeX: [0, 100000], sizeZ: [0, 100000], minScale: [0.001, 1000], maxScale: [0.001, 1000], tiltDegrees: [0, 90], seed: [-1e9, 1e9],
+    });
+    if (problem) {
+      return this.createErrorResponse(problem, ['Check the numbers'], { code: 'INVALID_ARGUMENT' });
+    }
+    if (args.primitive !== undefined && !['box', 'sphere', 'cylinder', 'cone'].includes(args.primitive)) {
+      return this.createErrorResponse('primitive must be box, sphere, cylinder or cone', ['Check primitive'], { code: 'INVALID_ARGUMENT' });
+    }
+    if (args.color !== undefined && !/^#?[0-9a-fA-F]{6}$/.test(String(args.color))) {
+      return this.createErrorResponse('color must look like #4f8a3c', ['Check color'], { code: 'INVALID_ARGUMENT' });
+    }
+    const nodeName: string = args.nodeName ?? 'Scatter';
+    if (!this.isSafeNodeName(nodeName)) {
+      return this.createErrorResponse('Invalid nodeName: it cannot contain slashes, quotes, dots, colons, @ or %', ['Check nodeName'], { code: 'INVALID_ARGUMENT' });
+    }
+    let meshPath: string | undefined;
+    if (args.meshPath !== undefined) {
+      if (!/\.(tres|res|obj)$/i.test(String(args.meshPath))) {
+        return this.createErrorResponse('meshPath must be a Mesh resource: .tres, .res or .obj', ['Save the mesh as a .tres, or leave meshPath out to use a primitive'], { code: 'INVALID_ARGUMENT' });
+      }
+      if (!existsSync(join(projectRoot, args.meshPath))) {
+        return this.createErrorResponse(`Mesh does not exist: ${args.meshPath}`, ['Check the path relative to the project'], { code: 'INVALID_PATH' });
+      }
+      meshPath = String(args.meshPath).replace(/\\/g, '/');
+    }
+    if (this.isInheritedSceneFile(sceneFile)) {
+      return this.createErrorResponse(`${args.scenePath} inherits from another scene`, ['Run the tool on the base scene'], { code: 'INVALID_ARGUMENT' });
+    }
+
+    const before = readFileSync(sceneFile, 'utf8');
+    const eol = before.includes('\r\n') ? '\r\n' : '\n';
+    const rootName = sceneRootName(before);
+    const parentPath: string = args.parentNodePath ?? rootName;
+    const parentKey = nodeKeyFromPath(parentPath, rootName);
+    const lines = before.split(/\r?\n/);
+    if (parentKey === null || (parentKey !== '' && !locateNodeSection(lines, parentKey))) {
+      return this.createErrorResponse(`Parent node not found: ${parentPath}`, ['Use read_scene to see the node paths (they start with the root name)'], { code: 'INVALID_ARGUMENT' });
+    }
+    const parentAttribute = parentKey === '' ? '.' : parentKey;
+    const newKey = sceneNodeKey(parentAttribute, nodeName);
+    if (locateNodeSection(lines, newKey)) {
+      return this.createErrorResponse(`A node named ${nodeName} already exists under ${parentPath}`, ['Choose another nodeName'], { code: 'INVALID_ARGUMENT' });
+    }
+
+    // Seeded random numbers, so the same call gives the same layout.
+    const count: number = args.count ?? 100;
+    const seed: number = args.seed ?? 1;
+    let state = Math.floor(seed) >>> 0;
+    const random = (): number => {
+      state = (state + 0x6d2b79f5) >>> 0;
+      let t = state;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const between = (min: number, max: number): number => min + (max - min) * random();
+    const minScale: number = args.minScale ?? 1;
+    const maxScale: number = Math.max(args.maxScale ?? 1, minScale);
+    const tilt = ((args.tiltDegrees ?? 0) * Math.PI) / 180;
+    const [centerX, centerZ, height] = [args.centerX ?? 0, args.centerZ ?? 0, args.y ?? 0];
+    const [sizeX, sizeZ] = [args.sizeX ?? 20, args.sizeZ ?? 20];
+    const format = (value: number): string => String(Math.round(value * 100000) / 100000);
+
+    const floats: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const scale = between(minScale, maxScale);
+      const yaw = args.randomYaw === false ? 0 : between(0, 2 * Math.PI);
+      const [cy, sy] = [Math.cos(yaw), Math.sin(yaw)];
+      // Rotation around the vertical axis: rows of the matrix.
+      let m = [[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]];
+      if (tilt > 0) {
+        let [ax, az] = [between(-1, 1), between(-1, 1)];
+        const length = Math.hypot(ax, az);
+        if (length > 0) {
+          [ax, az] = [ax / length, az / length];
+          const angle = between(0, tilt);
+          const [c, s] = [Math.cos(angle), Math.sin(angle)];
+          // Rodrigues' formula for the axis (ax, 0, az), applied after the yaw.
+          const r = [
+            [c + (1 - c) * ax * ax, -s * az, (1 - c) * ax * az],
+            [s * az, c, -s * ax],
+            [(1 - c) * ax * az, s * ax, c + (1 - c) * az * az],
+          ];
+          m = r.map((row) => [0, 1, 2].map((col) => row[0] * m[0][col] + row[1] * m[1][col] + row[2] * m[2][col]));
+        }
+      }
+      const origin = [centerX + between(-sizeX / 2, sizeX / 2), height, centerZ + between(-sizeZ / 2, sizeZ / 2)];
+      for (let row = 0; row < 3; row++) {
+        floats.push(format(m[row][0] * scale), format(m[row][1] * scale), format(m[row][2] * scale), format(origin[row]));
+      }
+    }
+
+    const suffix = Math.random().toString(36).slice(2, 7);
+    const multiMeshId = `MultiMesh_${suffix}`;
+    const blocks: string[][] = [];
+    let text = before;
+    let meshReference: string;
+    if (meshPath) {
+      const added = addExternalResource(text, 'Mesh', `res://${meshPath}`);
+      text = added.text;
+      meshReference = `ExtResource("${added.id}")`;
+    } else {
+      const size: number = args.primitiveSize ?? 1;
+      const hex = String(args.color ?? '#7fb36a').replace('#', '');
+      const [red, green, blue] = [0, 2, 4].map((at) => (parseInt(hex.slice(at, at + 2), 16) / 255).toFixed(4));
+      const materialId = `StandardMaterial3D_${suffix}`;
+      const meshId = `Mesh_${suffix}`;
+      blocks.push([`[sub_resource type="StandardMaterial3D" id="${materialId}"]`, `albedo_color = Color(${red}, ${green}, ${blue}, 1)`]);
+      const shape: Record<string, string[]> = {
+        box: ['BoxMesh', `size = Vector3(${size}, ${size}, ${size})`],
+        sphere: ['SphereMesh', `radius = ${size / 2}`, `height = ${size}`],
+        cylinder: ['CylinderMesh', `top_radius = ${size / 4}`, `bottom_radius = ${size / 4}`, `height = ${size}`],
+        cone: ['CylinderMesh', 'top_radius = 0.0', `bottom_radius = ${size / 2}`, `height = ${size}`],
+      };
+      const [meshType, ...meshLines] = shape[args.primitive ?? 'box'];
+      blocks.push([`[sub_resource type="${meshType}" id="${meshId}"]`, ...meshLines, `material = SubResource("${materialId}")`]);
+      meshReference = `SubResource("${meshId}")`;
+    }
+    blocks.push([
+      `[sub_resource type="MultiMesh" id="${multiMeshId}"]`,
+      'transform_format = 1',
+      `instance_count = ${count}`,
+      `mesh = ${meshReference}`,
+      `buffer = PackedFloat32Array(${floats.join(', ')})`,
+    ]);
+
+    // Sub-resources go before the first node, where Godot writes them.
+    const textLines = text.split(/\r?\n/);
+    let firstNode = textLines.findIndex((line) => line.startsWith('[node'));
+    if (firstNode === -1) {
+      firstNode = textLines.length;
+    }
+    textLines.splice(firstNode, 0, ...blocks.flatMap((block) => [...block, '']));
+    text = appendNodeSection(textLines.join(eol), nodeName, 'MultiMeshInstance3D', parentAttribute);
+    text = setSceneProperty(text, newKey, 'multimesh', `SubResource("${multiMeshId}")`);
+    writeFileSync(sceneFile, text);
+
+    // Godot must still load the scene with the new node in it; otherwise the file goes back as it was.
+    try {
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+      }
+      const nodePath = parentKey === '' ? `${rootName}/${nodeName}` : `${rootName}/${parentKey}/${nodeName}`;
+      const problemAfter = await this.verifyOrRestore(args.projectPath, sceneFile, before, [{ params: { scenePath: args.scenePath, nodePath }, mode: 'exists' }]);
+      if (problemAfter) {
+        return this.createErrorResponse(problemAfter, ['Check meshPath: it must be a Mesh resource'], { code: 'OPERATION_FAILED' });
+      }
+    } catch (error: any) {
+      writeFileSync(sceneFile, before);
+      return this.createErrorResponse(`Failed to check the scene after scattering: ${error?.message || 'Unknown error'}. The scene file was restored.`, ['Ensure Godot is installed and GODOT_PATH is set correctly']);
+    }
+
+    const result = { node: nodeName, instances: count, seed };
+    return {
+      content: [
+        { type: 'text', text: `Scattered ${count} copies in ${nodeName} (seed ${seed}).` },
+        { type: 'text', text: JSON.stringify(result, null, 2) },
+      ],
+    };
+  }
+
+  /** Handle the bake_navmesh tool */
+  private async handleBakeNavmesh(rawArgs: any) {
+    return this.runEditTool(rawArgs, {
+      operation: 'bake_navmesh',
+      label: 'bake_navmesh',
+      required: ['scenePath'],
+      build: (args) => {
+        if (args.parsedGeometry !== undefined && !['meshes', 'colliders', 'both'].includes(args.parsedGeometry)) {
+          return { error: 'parsedGeometry must be meshes, colliders or both' };
+        }
+        const problem = this.checkNumbers(args, {
+          agentRadius: [0.01, 100], agentHeight: [0.01, 100], agentMaxClimb: [0, 100], agentMaxSlope: [0, 90], cellSize: [0.01, 10], cellHeight: [0.01, 10],
+        });
+        if (problem) {
+          return { error: problem };
+        }
+        if (args.nodeName !== undefined && !this.isSafeNodeName(args.nodeName)) {
+          return { error: 'Invalid nodeName: it cannot contain slashes, quotes, dots, colons, @ or %' };
+        }
+        return {
+          params: this.pickParams(args, ['geometryPath', 'parsedGeometry', 'agentRadius', 'agentHeight', 'agentMaxClimb', 'agentMaxSlope', 'cellSize', 'cellHeight', 'parentNodePath', 'nodeName'], { scenePath: args.scenePath }),
+        };
+      },
+      summary: (r) => `Baked ${r.polygons} polygons (${r.vertices} vertices) in ${r.node}.`,
+    });
+  }
+
+  /** Handle the render_scene_3d tool: draw a scene from several viewpoints and return one PNG per view. */
+  private async handleRenderScene3d(rawArgs: any) {
+    const args = this.normalizeParameters(rawArgs ?? {});
+    if (typeof args.projectPath !== 'string' || !args.projectPath || typeof args.scenePath !== 'string' || !args.scenePath) {
+      return this.createErrorResponse('projectPath and scenePath are required', ['Provide both as text'], { code: 'INVALID_ARGUMENT' });
+    }
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse('Invalid project path', ['Provide a valid path without ".." segments'], { code: 'INVALID_PATH' });
+    }
+    const allViews = ['iso', 'front', 'back', 'left', 'right', 'top'];
+    const views: unknown = args.views ?? ['iso'];
+    if (!Array.isArray(views) || views.length === 0 || views.length > 6 || !views.every((v) => allViews.includes(v)) || new Set(views).size !== views.length) {
+      return this.createErrorResponse(`views must be 1 to 6 different values from: ${allViews.join(', ')}`, ['Check views'], { code: 'INVALID_ARGUMENT' });
+    }
+    const problem = this.checkNumbers(args, { width: [64, 2048], height: [64, 2048] });
+    if (problem) {
+      return this.createErrorResponse(problem, ['Check the numbers'], { code: 'INVALID_ARGUMENT' });
+    }
+    if (args.light !== undefined && args.light !== 'auto' && args.light !== 'none') {
+      return this.createErrorResponse('light must be auto or none', ['Check light'], { code: 'INVALID_ARGUMENT' });
+    }
+    const width: number = args.width ?? 640;
+    const height: number = args.height ?? 480;
+
+    const projectRoot = resolvePath(args.projectPath);
+    if (!existsSync(join(projectRoot, 'project.godot'))) {
+      return this.createErrorResponse(`Not a valid Godot project: ${args.projectPath}`, ['Ensure the path points to a directory containing a project.godot file'], { code: 'PROJECT_NOT_FOUND' });
+    }
+    if (!existsSync(join(projectRoot, args.scenePath))) {
+      return this.createErrorResponse(`Scene file does not exist: ${args.scenePath}`, ['Check the path relative to the project'], { code: 'INVALID_PATH' });
+    }
+
+    const tempDir = mkdtempSync(join(tmpdir(), 'godot-mcp-render3d-'));
+    try {
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+      }
+      if (!this.godotPath) {
+        return this.createErrorResponse('Could not find a valid Godot executable path', ['Set GODOT_PATH environment variable to specify the correct path'], { code: 'GODOT_NOT_FOUND' });
+      }
+      let output = '';
+      try {
+        const { stdout, stderr } = await execFileAsync(
+          this.godotPath,
+          [
+            '--path', projectRoot, '--resolution', `${width}x${height}`, '--script', this.renderScene3dPath, '--',
+            `res://${args.scenePath}`, tempDir, (views as string[]).join(','), args.light ?? 'auto',
+          ],
+          { timeout: 120000, maxBuffer: 16 * 1024 * 1024 }
+        );
+        output = `${stdout}\n${stderr}`;
+      } catch (error: any) {
+        if (error?.killed) {
+          return this.createErrorResponse('The render did not finish within 120 seconds', ['The scene may be stuck loading, or no display is available'], { code: 'TIMEOUT' });
+        }
+        if (typeof error?.code !== 'number') {
+          throw error;
+        }
+        output = `${error?.stdout ?? ''}\n${error?.stderr ?? ''}`;
+      }
+      const rendered = (views as string[]).filter((view) => existsSync(join(tempDir, `${view}.png`)));
+      if (rendered.length === 0) {
+        const reason = output.split(/\r?\n/).find((line) => line.startsWith('RENDER_FAIL')) ?? output.trim().split(/\r?\n/).slice(-3).join('\n');
+        return this.createErrorResponse(
+          `Godot did not render the scene: ${reason || 'no output'}`,
+          ['This tool needs a display and a graphics driver; it cannot run headless or without a display', 'Check the scene with check_project_scripts and verify_game'],
+        );
+      }
+      const scriptErrors = this.groupScriptErrors(this.parseScriptErrors(output));
+      const content: any[] = [
+        {
+          type: 'text',
+          text: JSON.stringify({ scene: args.scenePath, width, height, views: rendered, missingViews: (views as string[]).filter((v) => !rendered.includes(v)), scriptErrors: scriptErrors.scriptErrors }, null, 2),
+        },
+      ];
+      for (const view of rendered) {
+        content.push({ type: 'text', text: `View: ${view}` });
+        content.push({ type: 'image', data: readFileSync(join(tempDir, `${view}.png`)).toString('base64'), mimeType: 'image/png' });
+      }
+      return { content, isError: rendered.length < (views as string[]).length || scriptErrors.scriptErrors.length > 0 };
     } catch (error: any) {
       return this.createErrorResponse(`Failed to render the scene: ${error?.message || 'Unknown error'}`, ['Ensure Godot is installed and GODOT_PATH is set correctly']);
     } finally {
