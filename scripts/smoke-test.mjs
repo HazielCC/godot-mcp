@@ -50,6 +50,9 @@ const EXPECTED_TOOLS = [
   'ui_lint',
   'ui_check_focus',
   'ui_check_contrast',
+  'create_particles',
+  'tune_particles',
+  'render_particles',
 ];
 
 const TIMEOUT_MS = 15000;

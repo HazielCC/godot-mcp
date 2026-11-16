@@ -97,6 +97,10 @@ func _init() -> void:
             build_ui(params)
         "make_theme":
             make_theme(params)
+        "create_particles":
+            create_particles(params)
+        "tune_particles":
+            tune_particles(params)
         "bake_navmesh":
             # Reading geometry needs the scene inside a running tree, which only exists after _init.
             _deferred_params = params
@@ -2646,3 +2650,406 @@ func make_theme(params: Dictionary) -> void:
         assigned = str(params.node_path)
         scene_root.free()
     _result({"output": output_path, "types": styled, "assigned_to": assigned})
+
+
+# ---------------------------------------------------------------------------
+# Particle tools: create_particles, tune_particles.
+# Presets are written in meters (3D). In 2D, lengths, speeds and gravity are multiplied by 64 (pixels per
+# meter), and "up" becomes -Y.
+# ---------------------------------------------------------------------------
+
+const PARTICLE_UNIT_2D: float = 64.0
+
+const PARTICLE_KEYS: Array = [
+    "amount", "lifetime", "one_shot", "explosiveness", "emitting", "shape", "extent", "direction", "spread",
+    "speed_min", "speed_max", "gravity", "scale_min", "scale_max", "size", "blend", "texture", "texture_path", "turbulence",
+]
+
+func _particle_presets() -> Dictionary:
+    return {
+        "fire": {
+            "amount": 48, "lifetime": 1.0, "one_shot": false, "explosiveness": 0.0,
+            "shape": "sphere", "extent": [0.15, 0.15, 0.15], "direction": [0, 1, 0], "spread": 12.0,
+            "speed_min": 1.2, "speed_max": 2.2, "gravity": [0, 1.5, 0], "damping": 0.0,
+            "scale_min": 0.6, "scale_max": 1.2, "scale_curve": [[0.0, 0.8], [0.4, 1.0], [1.0, 0.0]],
+            "ramp": [[0.0, "#fff2b0ff"], [0.3, "#ffb030ff"], [0.7, "#ff4a10b3"], [1.0, "#40100800"]],
+            "blend": "add", "texture": "soft", "size": 0.5, "turbulence": 0.0,
+        },
+        "smoke": {
+            "amount": 24, "lifetime": 3.0, "one_shot": false, "explosiveness": 0.0,
+            "shape": "sphere", "extent": [0.2, 0.2, 0.2], "direction": [0, 1, 0], "spread": 20.0,
+            "speed_min": 0.3, "speed_max": 0.8, "gravity": [0, 0.3, 0], "damping": 0.2,
+            "scale_min": 0.8, "scale_max": 1.4, "scale_curve": [[0.0, 0.5], [1.0, 1.6]],
+            "ramp": [[0.0, "#77777700"], [0.15, "#808080a0"], [1.0, "#40404000"]],
+            "blend": "mix", "texture": "soft", "size": 0.8, "turbulence": 0.4,
+        },
+        "sparks": {
+            "amount": 40, "lifetime": 0.7, "one_shot": true, "explosiveness": 0.95,
+            "shape": "point", "extent": [0.05, 0.05, 0.05], "direction": [0, 1, 0], "spread": 55.0,
+            "speed_min": 2.0, "speed_max": 5.0, "gravity": [0, -9.8, 0], "damping": 0.0,
+            "scale_min": 0.4, "scale_max": 1.0, "scale_curve": [[0.0, 1.0], [1.0, 0.0]],
+            "ramp": [[0.0, "#ffffffff"], [0.4, "#ffd060ff"], [1.0, "#ff601000"]],
+            "blend": "add", "texture": "spark", "size": 0.2, "turbulence": 0.0,
+        },
+        "explosion": {
+            "amount": 80, "lifetime": 0.9, "one_shot": true, "explosiveness": 1.0,
+            "shape": "sphere", "extent": [0.1, 0.1, 0.1], "direction": [0, 1, 0], "spread": 180.0,
+            "speed_min": 3.0, "speed_max": 8.0, "gravity": [0, 0.5, 0], "damping": 5.0,
+            "scale_min": 0.6, "scale_max": 1.5, "scale_curve": [[0.0, 0.6], [0.3, 1.0], [1.0, 0.2]],
+            "ramp": [[0.0, "#ffffe0ff"], [0.2, "#ffb030ff"], [0.6, "#6a3020b0"], [1.0, "#20202000"]],
+            "blend": "add", "texture": "soft", "size": 0.6, "turbulence": 0.0,
+        },
+        "rain": {
+            "amount": 300, "lifetime": 1.0, "one_shot": false, "explosiveness": 0.0,
+            "shape": "box", "extent": [6.0, 0.05, 6.0], "direction": [0, -1, 0], "spread": 2.0,
+            "speed_min": 9.0, "speed_max": 12.0, "gravity": [0, -6.0, 0], "damping": 0.0,
+            "scale_min": 0.6, "scale_max": 1.0, "scale_curve": [],
+            "ramp": [[0.0, "#bcd8ff00"], [0.1, "#bcd8ffc0"], [1.0, "#bcd8ff80"]],
+            "blend": "mix", "texture": "streak", "size": 0.6, "turbulence": 0.0,
+        },
+        "snow": {
+            "amount": 150, "lifetime": 5.0, "one_shot": false, "explosiveness": 0.0,
+            "shape": "box", "extent": [6.0, 0.05, 6.0], "direction": [0, -1, 0], "spread": 25.0,
+            "speed_min": 0.5, "speed_max": 1.2, "gravity": [0, -0.3, 0], "damping": 0.0,
+            "scale_min": 0.4, "scale_max": 0.9, "scale_curve": [],
+            "ramp": [[0.0, "#ffffff00"], [0.1, "#ffffffff"], [0.9, "#ffffffff"], [1.0, "#ffffff00"]],
+            "blend": "mix", "texture": "soft", "size": 0.15, "turbulence": 0.3,
+        },
+        "magic": {
+            "amount": 36, "lifetime": 1.6, "one_shot": false, "explosiveness": 0.0,
+            "shape": "sphere", "extent": [0.4, 0.4, 0.4], "direction": [0, 1, 0], "spread": 180.0,
+            "speed_min": 0.1, "speed_max": 0.6, "gravity": [0, 0.2, 0], "damping": 0.0,
+            "scale_min": 0.3, "scale_max": 0.8, "scale_curve": [[0.0, 0.0], [0.3, 1.0], [1.0, 0.0]],
+            "ramp": [[0.0, "#b36bffff"], [0.5, "#5ee0ffff"], [1.0, "#5ee0ff00"]],
+            "blend": "add", "texture": "spark", "size": 0.3, "turbulence": 0.5,
+        },
+        "dust": {
+            "amount": 20, "lifetime": 2.5, "one_shot": false, "explosiveness": 0.0,
+            "shape": "box", "extent": [1.5, 0.1, 1.5], "direction": [0, 1, 0], "spread": 180.0,
+            "speed_min": 0.05, "speed_max": 0.2, "gravity": [0, 0.02, 0], "damping": 0.0,
+            "scale_min": 0.4, "scale_max": 1.0, "scale_curve": [],
+            "ramp": [[0.0, "#d8c8a800"], [0.3, "#d8c8a860"], [1.0, "#d8c8a800"]],
+            "blend": "mix", "texture": "soft", "size": 0.12, "turbulence": 0.2,
+        },
+    }
+
+func _particle_vec3(value: Variant, fallback: Vector3) -> Vector3:
+    if typeof(value) == TYPE_ARRAY:
+        var items: Array = value
+        if items.size() >= 3:
+            return Vector3(float(items[0]), float(items[1]), float(items[2]))
+        if items.size() == 2:
+            return Vector3(float(items[0]), float(items[1]), 0.0)
+    return fallback
+
+func _make_gradient(offsets: Array, colors: Array) -> Gradient:
+    var gradient: Gradient = Gradient.new()
+    gradient.offsets = PackedFloat32Array(offsets)
+    gradient.colors = PackedColorArray(colors)
+    return gradient
+
+# A color ramp from the colors the caller gave: spread evenly, visible at the start and transparent at the end.
+func _ramp_from_colors(colors: Array) -> Array:
+    var ramp: Array = []
+    if colors.size() == 1:
+        ramp = [[0.0, str(colors[0]) + "ff"], [1.0, str(colors[0]) + "00"]]
+        return ramp
+    for index: int in range(colors.size()):
+        var offset: float = float(index) / float(colors.size() - 1)
+        ramp.append([offset, str(colors[index]) + ("00" if index == colors.size() - 1 else "ff")])
+    return ramp
+
+func _particle_texture(kind: String) -> Texture2D:
+    var texture: GradientTexture2D = GradientTexture2D.new()
+    texture.fill = GradientTexture2D.FILL_RADIAL
+    texture.fill_from = Vector2(0.5, 0.5)
+    texture.fill_to = Vector2(1.0, 0.5)
+    texture.width = 64
+    texture.height = 64
+    match kind:
+        "spark":
+            texture.gradient = _make_gradient([0.0, 0.2, 1.0], [Color.WHITE, Color(1, 1, 1, 0.85), Color(1, 1, 1, 0)])
+        "streak":
+            texture.width = 16
+            texture.height = 64
+            texture.gradient = _make_gradient([0.0, 0.5, 1.0], [Color.WHITE, Color(1, 1, 1, 0.6), Color(1, 1, 1, 0)])
+        _:
+            texture.gradient = _make_gradient([0.0, 1.0], [Color.WHITE, Color(1, 1, 1, 0)])
+    return texture
+
+func _configure_particle_material(material: ParticleProcessMaterial, spec: Dictionary, dimension: String) -> void:
+    var unit: float = PARTICLE_UNIT_2D if dimension == "2d" else 1.0
+    if dimension == "2d":
+        material.particle_flag_disable_z = true
+
+    if spec.has("shape") or spec.has("extent"):
+        var shape_name: String = str(spec.get("shape", ""))
+        var extent: Vector3 = _particle_vec3(spec.get("extent"), Vector3(0.2, 0.2, 0.2)) * unit
+        if shape_name == "":
+            if material.emission_shape == ParticleProcessMaterial.EMISSION_SHAPE_SPHERE:
+                shape_name = "sphere"
+            elif material.emission_shape == ParticleProcessMaterial.EMISSION_SHAPE_BOX:
+                shape_name = "box"
+            elif material.emission_shape == ParticleProcessMaterial.EMISSION_SHAPE_RING:
+                shape_name = "ring"
+        match shape_name:
+            "point":
+                material.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_POINT
+            "sphere":
+                material.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_SPHERE
+                material.emission_sphere_radius = extent.x
+            "box":
+                material.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_BOX
+                material.emission_box_extents = Vector3(extent.x, extent.y, 1.0 if dimension == "2d" else extent.z)
+            "ring":
+                material.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_RING
+                material.emission_ring_radius = extent.x
+                material.emission_ring_inner_radius = 0.0
+                material.emission_ring_height = 0.0
+                material.emission_ring_axis = Vector3(0, 0, 1) if dimension == "2d" else Vector3(0, 1, 0)
+
+    if spec.has("direction"):
+        var direction: Vector3 = _particle_vec3(spec.direction, Vector3(0, 1, 0))
+        material.direction = Vector3(direction.x, -direction.y, 0.0) if dimension == "2d" else direction
+    if spec.has("spread"):
+        material.spread = float(spec.spread)
+    if spec.has("speed_min"):
+        material.initial_velocity_min = float(spec.speed_min) * unit
+    if spec.has("speed_max"):
+        material.initial_velocity_max = float(spec.speed_max) * unit
+    if spec.has("gravity"):
+        var gravity: Vector3 = _particle_vec3(spec.gravity, Vector3.ZERO) * unit
+        material.gravity = Vector3(gravity.x, -gravity.y, 0.0) if dimension == "2d" else gravity
+    if spec.has("damping"):
+        material.damping_min = float(spec.damping) * unit
+        material.damping_max = float(spec.damping) * unit
+    var scale_factor: float = float(spec.get("_scale_factor", 1.0))
+    if spec.has("scale_min"):
+        material.scale_min = float(spec.scale_min) * scale_factor
+    if spec.has("scale_max"):
+        material.scale_max = float(spec.scale_max) * scale_factor
+    if spec.has("scale_curve"):
+        var points: Array = spec.scale_curve
+        if points.is_empty():
+            material.scale_curve = null
+        else:
+            var curve: Curve = Curve.new()
+            curve.min_value = 0.0
+            curve.max_value = 2.0
+            for point: Variant in points:
+                curve.add_point(Vector2(float((point as Array)[0]), float((point as Array)[1])))
+            var curve_texture: CurveTexture = CurveTexture.new()
+            curve_texture.curve = curve
+            material.scale_curve = curve_texture
+    if spec.has("ramp"):
+        var offsets: Array = []
+        var colors: Array = []
+        for stop: Variant in spec.ramp:
+            offsets.append(float((stop as Array)[0]))
+            colors.append(Color.html(str((stop as Array)[1])))
+        var ramp_texture: GradientTexture1D = GradientTexture1D.new()
+        ramp_texture.gradient = _make_gradient(offsets, colors)
+        ramp_texture.width = 128
+        material.color_ramp = ramp_texture
+    if spec.has("turbulence"):
+        material.turbulence_enabled = float(spec.turbulence) > 0.0
+        material.turbulence_noise_strength = float(spec.turbulence)
+
+func _particle_quad(size: float, texture: Texture2D, additive: bool) -> QuadMesh:
+    var mesh: QuadMesh = QuadMesh.new()
+    mesh.size = Vector2(size, size)
+    var material: StandardMaterial3D = StandardMaterial3D.new()
+    material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+    material.vertex_color_use_as_albedo = true
+    material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+    material.blend_mode = BaseMaterial3D.BLEND_MODE_ADD if additive else BaseMaterial3D.BLEND_MODE_MIX
+    material.billboard_mode = BaseMaterial3D.BILLBOARD_PARTICLES
+    material.billboard_keep_scale = true
+    material.cull_mode = BaseMaterial3D.CULL_DISABLED
+    material.albedo_texture = texture
+    mesh.material = material
+    return mesh
+
+# The texture a spec asks for: a file, or one of the generated shapes. Returns null when it has no texture key.
+func _particle_texture_for(spec: Dictionary) -> Texture2D:
+    if spec.has("texture_path"):
+        return load(_res_path(str(spec.texture_path))) as Texture2D
+    if spec.has("texture"):
+        return _particle_texture(str(spec.texture))
+    return null
+
+# Sets the node-level options in a spec (amount, lifetime, texture, blend, ...) on a particles node of either kind.
+func _configure_particle_node(node: Node, spec: Dictionary, dimension: String) -> String:
+    for key: String in ["amount", "lifetime", "one_shot", "explosiveness", "emitting"]:
+        if spec.has(key):
+            node.set(key, spec[key])
+    var texture: Texture2D = _particle_texture_for(spec)
+    if spec.has("texture_path") and texture == null:
+        return "could not load the texture " + str(spec.texture_path)
+    if dimension == "2d":
+        if texture != null:
+            node.set("texture", texture)
+        if spec.has("blend"):
+            if str(spec.blend) == "add":
+                var canvas_material: CanvasItemMaterial = CanvasItemMaterial.new()
+                canvas_material.blend_mode = CanvasItemMaterial.BLEND_MODE_ADD
+                node.set("material", canvas_material)
+            else:
+                node.set("material", null)
+    else:
+        var quad: QuadMesh = node.get("draw_pass_1") as QuadMesh
+        if quad != null and quad.material is StandardMaterial3D:
+            var quad_material: StandardMaterial3D = quad.material as StandardMaterial3D
+            if texture != null:
+                quad_material.albedo_texture = texture
+            if spec.has("blend"):
+                quad_material.blend_mode = BaseMaterial3D.BLEND_MODE_ADD if str(spec.blend) == "add" else BaseMaterial3D.BLEND_MODE_MIX
+    return ""
+
+# The overrides a caller gave, in the form a preset uses. `colors` becomes a ramp and a number `extent` a vector.
+func _particle_overrides(params: Dictionary) -> Dictionary:
+    var spec: Dictionary = {}
+    for key: String in PARTICLE_KEYS:
+        if params.has(key):
+            spec[key] = params[key]
+    if spec.has("extent") and typeof(spec.extent) != TYPE_ARRAY:
+        spec["extent"] = [float(spec.extent), float(spec.extent), float(spec.extent)]
+    if params.has("colors"):
+        spec["ramp"] = _ramp_from_colors(params.colors as Array)
+    return spec
+
+# The area the particles can reach, so the engine does not cull them while they are on screen.
+func _particle_reach(spec: Dictionary) -> float:
+    var extent: Vector3 = _particle_vec3(spec.get("extent"), Vector3(0.2, 0.2, 0.2))
+    var gravity: Vector3 = _particle_vec3(spec.get("gravity"), Vector3.ZERO)
+    var lifetime: float = float(spec.get("lifetime", 1.0))
+    return float(spec.get("speed_max", 1.0)) * lifetime + gravity.length() * lifetime * lifetime / 2.0 + extent.length() + float(spec.get("size", 0.5)) * 2.0
+
+# Adds a particle system to a scene from a preset (fire, smoke, sparks, explosion, rain, snow, magic, dust),
+# with any of the preset's values changed.
+func create_particles(params: Dictionary) -> void:
+    var what: String = "create particles"
+    var presets: Dictionary = _particle_presets()
+    var preset: String = str(params.get("preset", "fire"))
+    if not presets.has(preset):
+        _fail(what + ": unknown preset " + preset + "; use " + ", ".join(presets.keys()))
+        return
+    var dimension: String = str(params.get("dimension", "3d"))
+    var spec: Dictionary = (presets[preset] as Dictionary).duplicate(true)
+    var overrides: Dictionary = _particle_overrides(params)
+    for key: String in overrides:
+        spec[key] = overrides[key]
+    if overrides.has("texture_path"):
+        spec.erase("texture")
+
+    var scene_root: Node = _open_scene_root(str(params.scene_path), what)
+    if scene_root == null:
+        return
+    var parent: Node = _resolve_parent(scene_root, params)
+    if parent == null:
+        _fail(what + ": parent node not found: " + str(params.get("parent_node_path", "")))
+        scene_root.free()
+        return
+    var node_name: String = str(params.get("node_name", preset.capitalize()))
+    if parent.get_node_or_null(node_name) != null:
+        _fail(what + ": a node named " + node_name + " already exists under the parent")
+        scene_root.free()
+        return
+
+    var unit: float = PARTICLE_UNIT_2D if dimension == "2d" else 1.0
+    # In 2D the texture is 64 px and the scale is relative to it, so the size turns into a scale factor.
+    spec["_scale_factor"] = float(spec.get("size", 0.5)) * unit / 64.0 if dimension == "2d" else 1.0
+    var material: ParticleProcessMaterial = ParticleProcessMaterial.new()
+    _configure_particle_material(material, spec, dimension)
+    # Soft and spark shapes look the same turned; a streak (rain) or a texture of yours has a direction.
+    if not spec.has("texture_path") and str(spec.get("texture", "soft")) != "streak":
+        material.angle_min = -180.0
+        material.angle_max = 180.0
+
+    var node: Node = null
+    var reach: float = _particle_reach(spec)
+    if dimension == "2d":
+        var particles_2d: GPUParticles2D = GPUParticles2D.new()
+        particles_2d.process_material = material
+        particles_2d.visibility_rect = Rect2(-reach * unit, -reach * unit, reach * unit * 2.0, reach * unit * 2.0)
+        node = particles_2d
+    else:
+        var particles_3d: GPUParticles3D = GPUParticles3D.new()
+        particles_3d.process_material = material
+        var texture: Texture2D = _particle_texture_for(spec)
+        particles_3d.draw_pass_1 = _particle_quad(float(spec.get("size", 0.5)), texture, str(spec.get("blend", "mix")) == "add")
+        particles_3d.visibility_aabb = AABB(Vector3(-reach, -reach, -reach), Vector3(reach, reach, reach) * 2.0)
+        node = particles_3d
+    node.name = node_name
+    var problem: String = _configure_particle_node(node, spec, dimension)
+    if problem != "":
+        _fail(what + ": " + problem)
+        node.free()
+        scene_root.free()
+        return
+    if not spec.has("emitting"):
+        node.set("emitting", true)
+
+    if params.has("position"):
+        var position: Vector3 = _particle_vec3(params.position, Vector3.ZERO)
+        if dimension == "2d":
+            (node as Node2D).position = Vector2(position.x, position.y)
+        else:
+            (node as Node3D).position = position
+
+    var as_cpu: bool = bool(params.get("cpu", false))
+    if as_cpu:
+        var cpu: Node = CPUParticles2D.new() if dimension == "2d" else CPUParticles3D.new()
+        cpu.call("convert_from_particles", node)
+        if dimension == "2d":
+            cpu.set("material", node.get("material"))
+        cpu.name = node_name
+        cpu.set("position", node.get("position"))
+        node.free()
+        node = cpu
+
+    parent.add_child(node)
+    node.owner = scene_root
+    if not _save_scene_root(scene_root, str(params.scene_path), what):
+        scene_root.free()
+        return
+    var created_path: String = str(scene_root.name) + "/" + str(scene_root.get_path_to(node))
+    var created_class: String = node.get_class()
+    scene_root.free()
+    _result({"node": created_path, "class": created_class, "preset": preset, "dimension": dimension, "cpu": as_cpu, "amount": int(spec.get("amount", 0)), "lifetime": float(spec.get("lifetime", 0.0))})
+
+# Changes values of an existing GPUParticles2D or GPUParticles3D node. Only the values the caller gave change.
+func tune_particles(params: Dictionary) -> void:
+    var what: String = "tune particles"
+    var scene_root: Node = _open_scene_root(str(params.scene_path), what)
+    if scene_root == null:
+        return
+    var node: Node = _find_node(scene_root, str(scene_root.name), str(params.node_path))
+    var dimension: String = "3d"
+    if node is GPUParticles2D:
+        dimension = "2d"
+    elif not (node is GPUParticles3D):
+        _fail(what + ": " + str(params.node_path) + " is not a GPUParticles2D or GPUParticles3D node (CPU particles cannot be tuned; create them again with create_particles)")
+        scene_root.free()
+        return
+    var material: ParticleProcessMaterial = node.get("process_material") as ParticleProcessMaterial
+    if material == null:
+        _fail(what + ": the node has no ParticleProcessMaterial")
+        scene_root.free()
+        return
+    var spec: Dictionary = _particle_overrides(params)
+    if spec.is_empty():
+        _fail(what + ": nothing to change")
+        scene_root.free()
+        return
+    _configure_particle_material(material, spec, dimension)
+    var problem: String = _configure_particle_node(node, spec, dimension)
+    if problem != "":
+        _fail(what + ": " + problem)
+        scene_root.free()
+        return
+    if not _save_scene_root(scene_root, str(params.scene_path), what):
+        scene_root.free()
+        return
+    scene_root.free()
+    _result({"node": str(params.node_path), "changed": spec.keys()})

@@ -215,6 +215,40 @@ async function main() {
 
   const missingScene = await callTool('ui_check_contrast', { projectPath: project, scenePath: 'scenes/none.tscn' });
   check('ui_check_contrast reports a missing scene', missingScene.isError === true && textOf(missingScene).includes('does not exist'));
+
+  // Particle tools: bad arguments are rejected before Godot runs.
+  const badPreset = await callTool('create_particles', { projectPath: project, scenePath: 'scenes/main.tscn', preset: 'lava' });
+  check('create_particles rejects an unknown preset', badPreset.isError === true && textOf(badPreset).includes('preset'));
+
+  const manyParticles = await callTool('create_particles', { projectPath: project, scenePath: 'scenes/main.tscn', amount: 100000 });
+  check('create_particles limits the amount', manyParticles.isError === true && textOf(manyParticles).includes('amount'));
+
+  const badColors = await callTool('create_particles', { projectPath: project, scenePath: 'scenes/main.tscn', colors: ['red'] });
+  check('create_particles checks the colors', badColors.isError === true && textOf(badColors).includes('colors'));
+
+  const badGravity = await callTool('create_particles', { projectPath: project, scenePath: 'scenes/main.tscn', gravity: [1] });
+  check('create_particles checks the vectors', badGravity.isError === true && textOf(badGravity).includes('gravity'));
+
+  const badDimension = await callTool('create_particles', { projectPath: project, scenePath: 'scenes/main.tscn', dimension: '4d' });
+  check('create_particles checks the dimension', badDimension.isError === true && textOf(badDimension).includes('dimension'));
+
+  const failedParticles = await callTool('create_particles', { projectPath: project, scenePath: 'scenes/main.tscn', preset: 'fire' });
+  check('create_particles reports a Godot that failed', failedParticles.isError === true && !textOf(failedParticles).includes('Added'));
+
+  const nothingToTune = await callTool('tune_particles', { projectPath: project, scenePath: 'scenes/main.tscn', nodePath: 'Main/Fire' });
+  check('tune_particles needs a value to change', nothingToTune.isError === true && textOf(nothingToTune).includes('at least one'));
+
+  const tuneSize = await callTool('tune_particles', { projectPath: project, scenePath: 'scenes/main.tscn', nodePath: 'Main/Fire', size: 2 });
+  check('tune_particles refuses size', tuneSize.isError === true && textOf(tuneSize).includes('size'));
+
+  const unsortedTimes = await callTool('render_particles', { projectPath: project, scenePath: 'scenes/main.tscn', times: [0.5, 0.2] });
+  check('render_particles needs ascending times', unsortedTimes.isError === true && code(unsortedTimes) === 'INVALID_ARGUMENT');
+
+  const badBackground = await callTool('render_particles', { projectPath: project, scenePath: 'scenes/main.tscn', background: 'black' });
+  check('render_particles checks the background', badBackground.isError === true && textOf(badBackground).includes('background'));
+
+  const failedParticleRender = await callTool('render_particles', { projectPath: project, scenePath: 'scenes/main.tscn' });
+  check('render_particles reports a Godot that failed', failedParticleRender.isError === true && !failedParticleRender.content.some((c) => c.type === 'image'));
 }
 
 main()
