@@ -26,6 +26,12 @@ try {
     path.join(__dirname, '..', 'build', 'scripts', 'check_scripts.gd')
   );
 
+  // Copy render_scene.gd used by render_scene_2d
+  fs.copyFileSync(
+    path.join(__dirname, '..', 'src', 'scripts', 'render_scene.gd'),
+    path.join(__dirname, '..', 'build', 'scripts', 'render_scene.gd')
+  );
+
   // Copy the editor bridge plugin (addons/godot_mcp_bridge), installed into projects on request
   fs.copySync(
     path.join(__dirname, '..', 'src', 'addons', 'godot_mcp_bridge'),

@@ -149,6 +149,7 @@ Use this configuration:
 |----------|--------------|
 | `GODOT_PATH` | Path to the Godot executable. Use it if automatic detection fails. |
 | `DEBUG` | Set to `"true"` to show detailed server logs. |
+| `GODOT_MCP_DEBUG` | Set to `"true"` to make the scene operations print everything they do (and write test files in the project). Off by default. |
 
 ## Tools
 
@@ -178,6 +179,20 @@ Use this configuration:
 | `editor_status` | Checks whether the project is open in the editor with the bridge enabled, and reports the open scene and whether it is playing |
 | `editor_command` | Runs one command in the open editor: scene tree, open or save a scene, get or set a property (with undo), add a node, undo, redo, play, stop |
 | `verify_game` | Plays a scene with a probe, checks that the frame counter keeps advancing, takes a screenshot, lists the runtime errors and stops the game. Needs the editor open with the bridge |
+
+### 2D tools
+
+These need Godot 4.3 or later. Scenes that inherit from another scene are not edited by them: run them on the base scene.
+
+| Tool | What it does |
+|------|--------------|
+| `import_spritesheet` | Cuts a sprite sheet (`frameWidth`/`frameHeight`, or `columns`/`rows`) into a `SpriteFrames` resource with named animations (`row`, or `start` and `count`, plus `fps` and `loop`). With `scenePath` it also adds an `AnimatedSprite2D` that uses it |
+| `auto_collision` | Builds `CollisionPolygon2D` (or `LightOccluder2D` with `kind: "occluder"`) from the opaque pixels of a `Sprite2D`. Takes the region and the current frame of a sprite sheet into account. Options: `epsilon`, `minArea`, `alphaThreshold`, `replace` |
+| `build_tilemap` | Paints a `TileMapLayer` from rows of text, with a `legend` that maps each character to a cell of the tile atlas. Creates the `TileSet` from a texture when it does not exist |
+| `setup_parallax_2d` | Adds `Parallax2D` background layers, each with its texture, scroll scale and optional horizontal repeat |
+| `render_scene_2d` | Draws a scene and returns a PNG, to check how it looks. It opens a short-lived Godot window, so it needs a display and a graphics driver; it does not work headless |
+
+To try them, run `node scripts/fixtures/make-2d-fixture.mjs`. It writes a small project with a sprite sheet, a tile atlas and a scene, and prints its path.
 
 ## Building from source
 
